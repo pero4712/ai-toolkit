@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   ai-toolkit:
-    image: ostris/aitoolkit:latest
+    image: pero4712/aitoolkit:latest
     restart: unless-stopped
     ports:
       - "8675:8675"
