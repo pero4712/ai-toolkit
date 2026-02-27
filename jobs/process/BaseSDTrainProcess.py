@@ -704,6 +704,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.accelerator.is_main_process:
             self.logger.start()
         self.prepare_accelerator()
+        self.setup_ema()
         
     def sample_step_hook(self, img_num, total_imgs):
         pass
