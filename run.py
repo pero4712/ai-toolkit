@@ -22,7 +22,8 @@ if os.environ.get("DEBUG_TOOLKIT", "0") == "1":
 import argparse
 from toolkit.job import get_job
 from toolkit.accelerator import get_accelerator
-from toolkit.print import print_acc, setup_log_to_file
+from toolkit.print import print_acc, setup_log_to_file, get_git_sha
+from version import VERSION
 
 accelerator = get_accelerator()
 
@@ -88,6 +89,7 @@ def main():
     jobs_failed = 0
 
     if accelerator.is_main_process:
+        print_acc(f"ai-toolkit version: {VERSION} (commit: {get_git_sha()})")
         print_acc(f"Running {len(config_file_list)} job{'' if len(config_file_list) == 1 else 's'}")
 
     for config_file in config_file_list:

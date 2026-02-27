@@ -1,5 +1,6 @@
 import sys
 import os
+import subprocess
 from toolkit.accelerator import get_accelerator
 
 
@@ -21,6 +22,19 @@ class Logger:
     def flush(self):
         self.terminal.flush()
         self.log.flush()
+
+
+def get_git_sha():
+    try:
+        toolkit_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sha = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=toolkit_dir,
+            stderr=subprocess.DEVNULL,
+        ).decode('utf-8').strip()
+        return sha
+    except Exception:
+        return 'unknown'
 
 
 def setup_log_to_file(filename):
