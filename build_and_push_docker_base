@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+echo "Building base image (only needed when dependencies change)..."
+sleep 2
+
+# Build the base image
+docker build -t aitoolkit-base:latest -f docker/Dockerfile.base .
+
+# Tag and push
+docker tag aitoolkit-base:latest pero4712/aitoolkit-base:latest
+
+echo "Pushing base image to Docker Hub..."
+docker push pero4712/aitoolkit-base:latest
+
+echo "Successfully built and pushed pero4712/aitoolkit-base:latest"
