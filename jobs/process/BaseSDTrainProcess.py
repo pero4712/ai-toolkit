@@ -128,6 +128,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.first_sample_config = self.sample_config
         self.logging_config = LoggingConfig(**self.get_conf('logging', {}))
         self.logger = create_logger(self.logging_config, config, self.save_root)
+        if self.logging_config.structured_loss:
+            from toolkit.loss_tracker import LossTracker, LossLoggingConfig
+            self.loss_tracker = LossTracker(
+                LossLoggingConfig.from_logging_config(self.logging_config),
+                self.save_root,
+            )
+        else:
+            class _Stub:
+                enabled = False
+            self.loss_tracker = _Stub()
         self.optimizer: torch.optim.Optimizer = None
         self.lr_scheduler = None
         self.data_loader: Union[DataLoader, None] = None
@@ -2335,6 +2345,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         if self.progress_bar is not None:
                             self.progress_bar.unpause()
                 
+                # structured loss tracking
+                if self.accelerator.is_main_process and self.loss_tracker.enabled:
+                    self.loss_tracker.last_lr = learning_rate
+                    tracker_metrics = self.loss_tracker.commit_step(
+                        self.step_num,
+                        optimizer_stepped=not self.is_grad_accumulation_step,
+                    )
+                    if tracker_metrics:
+                        self.logger.log(tracker_metrics)
+                        if self.writer is not None:
+                            for key, value in tracker_metrics.items():
+                                self.writer.add_scalar(key, value, self.step_num)
+                    if self.step_num > 0 and self.step_num % self.loss_tracker.config.worst_every == 0:
+                        self.loss_tracker.log_worst_videos_table(self.step_num, self.logger)
+                        self.loss_tracker.log_matrix_table(self.step_num, self.logger)
+                        self.loss_tracker.log_summary_table(self.step_num, self.logger)
+
                 # commit log
                 if self.accelerator.is_main_process:
                     with self.timer('commit_logger'):
@@ -2369,6 +2396,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.accelerator.is_main_process:
             self.save()
             self.logger.finish()
+            if hasattr(self, 'loss_tracker') and self.loss_tracker.enabled:
+                self.loss_tracker.close()
         self.accelerator.end_training()
 
         if self.accelerator.is_main_process:

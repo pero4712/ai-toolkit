@@ -1,5 +1,5 @@
 import os
-from typing import TYPE_CHECKING, List, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 import cv2
 import torch
 
@@ -143,10 +143,19 @@ class FileItemDTO(
 
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
+        self._source_id: Optional[str] = None
         self.prior_reg = self.dataset_config.prior_reg
         self.tensor: Union[torch.Tensor, None] = None
         self.audio_data = None
         self.audio_tensor = None
+
+    @property
+    def source_id(self) -> str:
+        if self._source_id is None:
+            import hashlib
+            normalized = self.path.replace('\\', '/')
+            self._source_id = hashlib.md5(normalized.encode()).hexdigest()[:8]
+        return self._source_id
 
     def cleanup(self):
         self.tensor = None

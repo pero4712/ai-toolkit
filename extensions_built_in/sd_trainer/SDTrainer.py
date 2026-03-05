@@ -478,6 +478,7 @@ class SDTrainer(BaseSDTrainProcess):
             batch: 'DataLoaderBatchDTO',
             mask_multiplier: Union[torch.Tensor, float] = 1.0,
             prior_pred: Union[torch.Tensor, None] = None,
+            conditioned_prompts: Optional[List[str]] = None,
             **kwargs
     ):
         loss_target = self.train_config.loss_target
@@ -836,6 +837,11 @@ class SDTrainer(BaseSDTrainProcess):
             loss = loss.mean([1, 2, 3, 4])
         else:
             loss = loss.mean([1, 2, 3])
+
+        # Capture A: snapshot loss before any weighting
+        if hasattr(self, 'loss_tracker') and self.loss_tracker.enabled:
+            _loss_raw_snap = loss.detach().clone()
+
         # apply loss multiplier before prior loss
         # multiply by our mask
         try:
@@ -858,8 +864,48 @@ class SDTrainer(BaseSDTrainProcess):
                 # add min_snr_gamma
                 loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
+        # Capture B: record per-sample losses after weighting, before batch mean
+        if hasattr(self, 'loss_tracker') and self.loss_tracker.enabled and '_loss_raw_snap' in locals():
+            with torch.no_grad():
+                from toolkit.loss_tracker import LossEvent, _bucket_timestep
+                loss_raw_list = _loss_raw_snap.cpu().tolist()
+                loss_final_list = loss.detach().cpu().tolist()
+                boundary_idx = self._get_boundary_index()
+                _prompts = conditioned_prompts or []
+                for i in range(len(loss_raw_list)):
+                    file_item = batch.file_items[i] if i < len(batch.file_items) else batch.file_items[0]
+                    ds_cfg = file_item.dataset_config
+                    group_name = ds_cfg.dataset_name or os.path.basename(
+                        ds_cfg.dataset_path or ds_cfg.folder_path or "unknown"
+                    )
+                    prompt_i = _prompts[i] if i < len(_prompts) else ""
+                    t_val = int(timesteps[i].item()) if i < len(timesteps) else int(timesteps[0].item())
+                    self.loss_tracker.record_sample_loss(LossEvent(
+                        step=self.step_num,
+                        sample_idx=i,
+                        loss_raw=loss_raw_list[i],
+                        loss_final=loss_final_list[i],
+                        dataset_group=group_name,
+                        source_id=file_item.source_id,
+                        source_path=file_item.path if self.loss_tracker.config.debug else "",
+                        is_reg=file_item.is_reg,
+                        timestep=t_val,
+                        timestep_bucket=_bucket_timestep(
+                            t_val,
+                            self.train_config.num_train_timesteps,
+                            self.loss_tracker.config.noise_bucket_edges,
+                        ),
+                        boundary_index=boundary_idx,
+                        loss_multiplier=getattr(file_item, 'loss_multiplier', getattr(ds_cfg, 'loss_multiplier', 1.0)),
+                        token_dropout_rate=ds_cfg.token_dropout_rate,
+                        caption_dropout_rate=ds_cfg.caption_dropout_rate,
+                        is_caption_dropped=bool(prompt_i.strip() == ""),
+                        caption=prompt_i if self.loss_tracker.config.debug else None,
+                    ))
+            del _loss_raw_snap
+
         loss = loss.mean()
-        
+
         # check for audio loss
         if batch.audio_pred is not None and batch.audio_target is not None:
             audio_loss = torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean")
@@ -880,6 +926,12 @@ class SDTrainer(BaseSDTrainProcess):
 
 
         return loss + additional_loss
+
+    def _get_boundary_index(self) -> Optional[int]:
+        """Return current multistage boundary index, or None if not multistage."""
+        if hasattr(self.sd, 'is_multistage') and self.sd.is_multistage:
+            return getattr(self, 'current_boundary_index', None)
+        return None
 
     def preprocess_batch(self, batch: 'DataLoaderBatchDTO'):
         return batch
@@ -1982,6 +2034,7 @@ class SDTrainer(BaseSDTrainProcess):
                             batch=batch,
                             mask_multiplier=mask_multiplier,
                             prior_pred=prior_to_calculate_loss,
+                            conditioned_prompts=conditioned_prompts,
                         )
                     
                     if self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation:
@@ -2072,10 +2125,13 @@ class SDTrainer(BaseSDTrainProcess):
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor':
                 if isinstance(self.params[0], dict):
+                    _gn = None
                     for i in range(len(self.params)):
-                        self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
+                        _gn = self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
                 else:
-                    self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
+                    _gn = self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
+                if hasattr(self, 'loss_tracker') and self.loss_tracker.enabled:
+                    self.loss_tracker.last_grad_norm = float(_gn) if _gn is not None else 0.0
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()

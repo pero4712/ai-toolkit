@@ -38,6 +38,14 @@ class LoggingConfig:
         self.use_ui_logger: bool = kwargs.get('use_ui_logger', False)
         self.project_name: str = kwargs.get('project_name', 'ai-toolkit')
         self.run_name: str = kwargs.get('run_name', None)
+        # Structured loss logging
+        self.structured_loss: bool = kwargs.get('structured_loss', False)
+        self.structured_loss_debug: bool = kwargs.get('structured_loss_debug', False)
+        self.structured_loss_jsonl: bool = kwargs.get('structured_loss_jsonl', True)
+        self.structured_loss_worst_every: int = kwargs.get('structured_loss_worst_every', 500)
+        self.structured_loss_max_videos: int = kwargs.get('structured_loss_max_videos', 2000)
+        self.structured_loss_worst_min_count: int = kwargs.get('structured_loss_worst_min_count', 10)
+        self.structured_loss_noise_bucket_edges: Optional[List[int]] = kwargs.get('structured_loss_noise_bucket_edges', None)
 
 class SampleItem:
     def __init__(
@@ -950,6 +958,7 @@ class DatasetConfig:
         self.clip_image_shuffle_augmentations: bool = kwargs.get('clip_image_shuffle_augmentations', False)
         self.replacements: List[str] = kwargs.get('replacements', [])
         self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
+        self.dataset_name: Optional[str] = kwargs.get('dataset_name', None)
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)
