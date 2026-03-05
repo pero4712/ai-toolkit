@@ -30,8 +30,8 @@ def _sanitize_metric_name(name: str) -> str:
     ``LossTracker._get_sanitized_group()`` instead so collision detection
     works.
     """
-    name = name.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    name = re.sub(r"[^a-zA-Z0-9_\-]", "", name)
+    name = name.replace("/", "_").replace("\\", "_").replace(" ", "_").replace("-", "_")
+    name = re.sub(r"[^a-zA-Z0-9_]", "", name)
     return name
 
 
@@ -134,9 +134,11 @@ class VideoStats:
         "source_id",
         "dataset_group",
         "losses",
+        "losses_raw",
         "idx",
         "count",
         "sum",
+        "sum_raw",
         "total_count",
         "last_seen_step",
     )
@@ -150,17 +152,22 @@ class VideoStats:
         self.source_id = source_id
         self.dataset_group = dataset_group  # original unsanitized
         self.losses: List[float] = [0.0] * window
+        self.losses_raw: List[float] = [0.0] * window
         self.idx = 0
         self.count = 0
         self.sum = 0.0
+        self.sum_raw = 0.0
         self.total_count = 0
         self.last_seen_step = 0
 
-    def add(self, loss: float, step: int) -> None:
+    def add(self, loss_final: float, loss_raw: float, step: int) -> None:
         if self.count >= len(self.losses):
             self.sum -= self.losses[self.idx]
-        self.losses[self.idx] = loss
-        self.sum += loss
+            self.sum_raw -= self.losses_raw[self.idx]
+        self.losses[self.idx] = loss_final
+        self.losses_raw[self.idx] = loss_raw
+        self.sum += loss_final
+        self.sum_raw += loss_raw
         self.idx = (self.idx + 1) % len(self.losses)
         self.count = min(self.count + 1, len(self.losses))
         self.total_count += 1
@@ -169,6 +176,10 @@ class VideoStats:
     @property
     def mean(self) -> float:
         return self.sum / max(self.count, 1)
+
+    @property
+    def mean_raw(self) -> float:
+        return self.sum_raw / max(self.count, 1)
 
     @property
     def p90(self) -> float:
@@ -199,6 +210,12 @@ class LossTracker:
         self._bucket_emas: Dict[str, EMAScalar] = {}
         # Per-boundary EMAs (WAN 14B multistage)
         self._boundary_emas: Dict[int, EMAScalar] = {}
+
+        # Per-(group, bucket) matrix EMAs for cross-tabulation
+        self._matrix_emas: Dict[Tuple[str, str], EMAScalar] = {}
+        # Cumulative sample counts for summary table
+        self._group_sample_counts: Dict[str, int] = defaultdict(int)
+        self._bucket_sample_counts: Dict[str, int] = defaultdict(int)
 
         # Per-video tracking (bounded)
         self._video_stats: Dict[str, VideoStats] = {}
@@ -334,6 +351,24 @@ class LossTracker:
             self._boundary_emas[bidx].update(b_mean)
             metrics[f"loss_by_boundary/{bidx}"] = self._boundary_emas[bidx].value
 
+        # Group × bucket matrix EMAs
+        cell_losses: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+        for e in events:
+            g_key = self._get_sanitized_group(e.dataset_group)
+            cell_losses[(g_key, e.timestep_bucket)].append(e.loss_final)
+        for (g_key, b_key), losses in cell_losses.items():
+            cell_mean = sum(losses) / len(losses)
+            if (g_key, b_key) not in self._matrix_emas:
+                self._matrix_emas[(g_key, b_key)] = EMAScalar(span=200)
+            self._matrix_emas[(g_key, b_key)].update(cell_mean)
+
+        # Cumulative sample counts for summary table
+        for group, losses in group_losses.items():
+            g_key = self._get_sanitized_group(group)
+            self._group_sample_counts[g_key] += len(losses)
+        for bucket, losses in bucket_losses.items():
+            self._bucket_sample_counts[bucket] += len(losses)
+
         # Per-video tracking
         for e in events:
             self._update_video_stats(e, step)
@@ -364,7 +399,7 @@ class LossTracker:
             self._video_stats[sid] = VideoStats(
                 sid, event.dataset_group, window=50
             )
-        self._video_stats[sid].add(event.loss_final, step)
+        self._video_stats[sid].add(event.loss_final, event.loss_raw, step)
 
     def get_worst_videos(
         self, top_n: int = 20
@@ -386,7 +421,7 @@ class LossTracker:
                 v.source_id,
                 v.dataset_group,
                 v.mean,
-                v.mean,  # raw mean not separately tracked per-video; same as final
+                v.mean_raw,
                 v.p90,
                 v.total_count,
             ))
@@ -418,12 +453,13 @@ class LossTracker:
                         "source_id",
                         "dataset_group",
                         "mean_loss_final",
+                        "mean_loss_raw",
                         "p90_loss_final",
                         "count",
                     ],
                     data=[
-                        [sid, grp, mean_f, p90, cnt]
-                        for sid, grp, mean_f, _mean_r, p90, cnt in worst
+                        [sid, grp, mean_f, mean_r, p90, cnt]
+                        for sid, grp, mean_f, mean_r, p90, cnt in worst
                     ],
                 )
                 logger._log({"worst_videos": table}, commit=False)
@@ -432,53 +468,18 @@ class LossTracker:
 
     def log_matrix_table(self, step: int, logger: Any) -> None:
         """Log group × noise bucket cross-tabulation as a W&B Table."""
-        if not hasattr(logger, "_log"):
+        if not self._matrix_emas:
             return
 
-        # Build matrix from current group/bucket EMA values
         rows = []
-        for g_key, g_ema in self._group_emas.items():
-            for b_key, b_ema in self._bucket_emas.items():
-                rows.append([g_key, b_key, g_ema.value, b_ema.value])
-
-        if not rows:
-            return
-
-        try:
-            import wandb
-
-            table = wandb.Table(
-                columns=["group", "noise_bucket", "group_ema", "bucket_ema"],
-                data=rows,
-            )
-            logger._log({"loss_matrix": table}, commit=False)
-        except ImportError:
-            pass
-
-    def log_summary_table(self, step: int, logger: Any) -> None:
-        """At-a-glance health report: per-group and per-bucket stats."""
-        rows = []
-
-        # Group rows
-        for g_key, g_ema in sorted(self._group_emas.items()):
-            rows.append(["group", g_key, g_ema.value])
-
-        # Bucket rows
-        for b_key, b_ema in sorted(self._bucket_emas.items()):
-            rows.append(["noise", b_key, b_ema.value])
-
-        # Boundary rows
-        for bidx, b_ema in sorted(self._boundary_emas.items()):
-            rows.append(["boundary", str(bidx), b_ema.value])
-
-        if not rows:
-            return
+        for (g_key, b_key), ema in sorted(self._matrix_emas.items()):
+            rows.append([g_key, b_key, ema.value])
 
         # Console
-        print(f"\n[LossTracker] Training summary at step {step}:")
-        print(f"  {'type':<10} {'name':<20} {'ema_200':>10}")
-        for typ, name, val in rows:
-            print(f"  {typ:<10} {name:<20} {val:>10.6f}")
+        print(f"\n[LossTracker] Loss matrix at step {step}:")
+        print(f"  {'group':<20} {'bucket':<8} {'mean_loss':>10}")
+        for g, b, v in rows:
+            print(f"  {g:<20} {b:<8} {v:>10.6f}")
         print()
 
         # W&B table
@@ -487,7 +488,46 @@ class LossTracker:
                 import wandb
 
                 table = wandb.Table(
-                    columns=["type", "name", "ema_200"],
+                    columns=["group", "noise_bucket", "mean_loss_final"],
+                    data=rows,
+                )
+                logger._log({"loss_matrix": table}, commit=False)
+            except ImportError:
+                pass
+
+    def log_summary_table(self, step: int, logger: Any) -> None:
+        """At-a-glance health report: per-group and per-bucket stats with sample counts."""
+        rows = []
+
+        # Group rows
+        for g_key, g_ema in sorted(self._group_emas.items()):
+            rows.append(["group", g_key, g_ema.value, self._group_sample_counts.get(g_key, 0)])
+
+        # Bucket rows
+        for b_key, b_ema in sorted(self._bucket_emas.items()):
+            rows.append(["noise", b_key, b_ema.value, self._bucket_sample_counts.get(b_key, 0)])
+
+        # Boundary rows
+        for bidx, b_ema in sorted(self._boundary_emas.items()):
+            rows.append(["boundary", str(bidx), b_ema.value, 0])
+
+        if not rows:
+            return
+
+        # Console
+        print(f"\n[LossTracker] Training summary at step {step}:")
+        print(f"  {'type':<10} {'name':<20} {'ema_200':>10} {'samples':>8}")
+        for typ, name, val, cnt in rows:
+            print(f"  {typ:<10} {name:<20} {val:>10.6f} {cnt:>8}")
+        print()
+
+        # W&B table
+        if hasattr(logger, "_log"):
+            try:
+                import wandb
+
+                table = wandb.Table(
+                    columns=["type", "name", "ema_200", "sample_count"],
                     data=rows,
                 )
                 logger._log({"training_summary": table}, commit=False)

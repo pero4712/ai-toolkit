@@ -2348,6 +2348,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # structured loss tracking
                 if self.accelerator.is_main_process and self.loss_tracker.enabled:
                     self.loss_tracker.last_lr = learning_rate
+                    if self.is_grad_accumulation_step:
+                        self.loss_tracker.last_grad_norm = 0.0
                     tracker_metrics = self.loss_tracker.commit_step(
                         self.step_num,
                         optimizer_stepped=not self.is_grad_accumulation_step,
