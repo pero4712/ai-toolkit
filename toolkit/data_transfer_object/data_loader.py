@@ -152,9 +152,8 @@ class FileItemDTO(
     @property
     def source_id(self) -> str:
         if self._source_id is None:
-            import hashlib
-            normalized = self.path.replace('\\', '/')
-            self._source_id = hashlib.md5(normalized.encode()).hexdigest()[:8]
+            import os
+            self._source_id = os.path.splitext(os.path.basename(self.path))[0]
         return self._source_id
 
     def cleanup(self):
