@@ -628,6 +628,76 @@ class LossTracker:
         print()
 
     # -----------------------------------------------------------------------
+    # Snapshot for web UI
+    # -----------------------------------------------------------------------
+
+    def _write_snapshot(self, step: int) -> None:
+        """Write a JSON snapshot of current tables for the web UI."""
+        snapshot: Dict[str, Any] = {
+            "step": step,
+            "wall_time": time.time(),
+            "run_id": self.run_id,
+            "worst_videos": [
+                {
+                    "source_id": sid,
+                    "dataset_group": grp,
+                    "mean_loss_final": round(mf, 6),
+                    "mean_loss_raw": round(mr, 6),
+                    "p90_loss_final": round(p90, 6),
+                    "count": cnt,
+                }
+                for sid, grp, mf, mr, p90, cnt in self.get_worst_videos(top_n=20)
+            ],
+            "matrix": [
+                {
+                    "group": g_key,
+                    "noise_bucket": b_key,
+                    "mean_loss_final": round(ema.value, 6),
+                }
+                for (g_key, b_key), ema in sorted(self._matrix_emas.items())
+            ],
+            "summary": [],
+            "ema": {
+                "ema_50": round(self._ema_50.value, 6),
+                "ema_200": round(self._ema_200.value, 6),
+                "ema_1000": round(self._ema_1000.value, 6),
+            },
+        }
+
+        # Build summary rows (same logic as log_summary_table)
+        for g_key, g_ema in sorted(self._group_emas.items()):
+            snapshot["summary"].append({
+                "type": "group",
+                "name": g_key,
+                "ema_200": round(g_ema.value, 6),
+                "sample_count": self._group_sample_counts.get(g_key, 0),
+            })
+        for b_key, b_ema in sorted(self._bucket_emas.items()):
+            snapshot["summary"].append({
+                "type": "noise",
+                "name": b_key,
+                "ema_200": round(b_ema.value, 6),
+                "sample_count": self._bucket_sample_counts.get(b_key, 0),
+            })
+        for bidx, b_ema in sorted(self._boundary_emas.items()):
+            snapshot["summary"].append({
+                "type": "boundary",
+                "name": str(bidx),
+                "ema_200": round(b_ema.value, 6),
+                "sample_count": 0,
+            })
+
+        # Atomic write: write to tmp, then rename
+        snapshot_path = os.path.join(
+            os.path.dirname(self._jsonl_path) if self._jsonl_path else ".",
+            "loss_analysis.json",
+        )
+        tmp_path = snapshot_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+        os.replace(tmp_path, snapshot_path)
+
+    # -----------------------------------------------------------------------
     # Cleanup
     # -----------------------------------------------------------------------
 

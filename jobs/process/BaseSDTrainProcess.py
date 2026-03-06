@@ -2363,6 +2363,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.loss_tracker.log_worst_videos_table(self.step_num, self.logger)
                         self.loss_tracker.log_matrix_table(self.step_num, self.logger)
                         self.loss_tracker.log_summary_table(self.step_num, self.logger)
+                        self.loss_tracker._write_snapshot(self.step_num)
 
                 # commit log
                 if self.accelerator.is_main_process:
