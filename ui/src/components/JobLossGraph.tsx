@@ -92,7 +92,7 @@ export default function JobLossGraph({ job }: Props) {
     setEnabled(prev => {
       const next = { ...prev };
       for (const k of lossKeys) {
-        if (next[k] === undefined) next[k] = true;
+        if (next[k] === undefined) next[k] = !k.includes('step_time_ms');
       }
       // drop removed keys
       for (const k of Object.keys(next)) {
@@ -260,16 +260,47 @@ export default function JobLossGraph({ job }: Props) {
                 />
                 <Tooltip
                   cursor={{ stroke: 'rgba(59,130,246,0.25)', strokeWidth: 1 }}
-                  contentStyle={{
-                    background: 'rgba(17,24,39,0.96)',
-                    border: '1px solid rgba(31,41,55,1)',
-                    borderRadius: 10,
-                    color: 'rgba(255,255,255,0.9)',
-                    fontSize: 12,
+                  content={({ active, payload, label }) => {
+                    if (!active || !payload?.length) return null;
+                    const lossEntries = payload.filter(
+                      p => p.name === 'loss' || p.name === 'loss (raw)'
+                    );
+                    const others = payload
+                      .filter(p => p.name !== 'loss' && p.name !== 'loss (raw)')
+                      .sort((a, b) => Number(b.value) - Number(a.value));
+                    const sorted = [...lossEntries, ...others];
+                    return (
+                      <div
+                        style={{
+                          background: 'rgba(17,24,39,0.96)',
+                          border: '1px solid rgba(31,41,55,1)',
+                          borderRadius: 10,
+                          padding: '8px 12px',
+                          fontSize: 12,
+                        }}
+                      >
+                        <div style={{ color: 'rgba(255,255,255,0.75)', marginBottom: 4 }}>
+                          step {label}
+                        </div>
+                        {sorted.map((entry, i) => (
+                          <div
+                            key={i}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              color: 'rgba(255,255,255,0.9)',
+                            }}
+                          >
+                            <span style={{ color: String(entry.color) }}>●</span>
+                            <span>
+                              {entry.name}: {formatNum(Number(entry.value))}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    );
                   }}
-                  labelStyle={{ color: 'rgba(255,255,255,0.75)' }}
-                  labelFormatter={(label: any) => `step ${label}`}
-                  formatter={(value: any, name: any) => [formatNum(Number(value)), name]}
                 />
 
                 <Legend
@@ -326,6 +357,24 @@ export default function JobLossGraph({ job }: Props) {
               <ToggleButton checked={showRaw} onClick={() => setShowRaw(v => !v)} label="Raw" />
               <ToggleButton checked={useLogScale} onClick={() => setUseLogScale(v => !v)} label="Log Y" />
               <ToggleButton checked={clipOutliers} onClick={() => setClipOutliers(v => !v)} label="Clip outliers" />
+              <ToggleButton
+                checked={activeKeys.length === 1 && activeKeys[0] === 'loss'}
+                onClick={() => {
+                  const next: Record<string, boolean> = {};
+                  for (const k of lossKeys) next[k] = k === 'loss';
+                  setEnabled(next);
+                }}
+                label="Loss only"
+              />
+              <ToggleButton
+                checked={activeKeys.length === lossKeys.filter(k => !k.includes('step_time_ms')).length}
+                onClick={() => {
+                  const next: Record<string, boolean> = {};
+                  for (const k of lossKeys) next[k] = !k.includes('step_time_ms');
+                  setEnabled(next);
+                }}
+                label="All"
+              />
             </div>
           </div>
 

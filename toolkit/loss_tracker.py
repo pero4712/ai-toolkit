@@ -216,6 +216,7 @@ class LossTracker:
         # Cumulative sample counts for summary table
         self._group_sample_counts: Dict[str, int] = defaultdict(int)
         self._bucket_sample_counts: Dict[str, int] = defaultdict(int)
+        self._boundary_sample_counts: Dict[int, int] = defaultdict(int)
 
         # Per-video tracking (bounded)
         self._video_stats: Dict[str, VideoStats] = {}
@@ -368,6 +369,8 @@ class LossTracker:
             self._group_sample_counts[g_key] += len(losses)
         for bucket, losses in bucket_losses.items():
             self._bucket_sample_counts[bucket] += len(losses)
+        for bidx, losses in boundary_losses.items():
+            self._boundary_sample_counts[bidx] += len(losses)
 
         # Per-video tracking
         for e in events:
@@ -509,7 +512,7 @@ class LossTracker:
 
         # Boundary rows
         for bidx, b_ema in sorted(self._boundary_emas.items()):
-            rows.append(["boundary", str(bidx), b_ema.value, 0])
+            rows.append(["boundary", str(bidx), b_ema.value, self._boundary_sample_counts.get(bidx, 0)])
 
         if not rows:
             return
@@ -684,7 +687,7 @@ class LossTracker:
                 "type": "boundary",
                 "name": str(bidx),
                 "ema_200": round(b_ema.value, 6),
-                "sample_count": 0,
+                "sample_count": self._boundary_sample_counts.get(bidx, 0),
             })
 
         # Atomic write: write to tmp, then rename
