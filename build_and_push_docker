@@ -9,13 +9,33 @@ else
     exit 1
 fi
 
-echo "Docker builds from the repo, not this dir. Make sure changes are pushed to the repo."
-echo "Building version: $VERSION and latest"
-# wait 2 seconds
+GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# Determine the correct base image from content hash
+BASE_HASH=$(cat docker/Dockerfile.base requirements.txt | sha256sum | cut -c1-12)
+BASE_TAG="pero4712/aitoolkit-base:$BASE_HASH"
+if ! docker manifest inspect "$BASE_TAG" > /dev/null 2>&1; then
+    echo "Base image $BASE_TAG not found. Building it now..."
+    ./build_and_push_docker_base || exit 1
+fi
+echo "Using base image: $BASE_TAG"
+
+# Check that the current branch has been pushed to the remote
+LOCAL_COMMIT=$(git rev-parse HEAD)
+REMOTE_COMMIT=$(git rev-parse "origin/$GIT_BRANCH" 2>/dev/null)
+if [ -z "$REMOTE_COMMIT" ]; then
+    echo "Error: Branch '$GIT_BRANCH' does not exist on the remote. Push it first."
+    exit 1
+elif [ "$LOCAL_COMMIT" != "$REMOTE_COMMIT" ]; then
+    echo "Error: Local branch '$GIT_BRANCH' is not in sync with remote. Push your changes first."
+    exit 1
+fi
+
+echo "Building version: $VERSION from branch: $GIT_BRANCH"
 sleep 2
 
 # Build the image with cache busting
-docker build --build-arg CACHEBUST=$(date +%s) -t aitoolkit:$VERSION -f docker/Dockerfile .
+docker build --build-arg CACHEBUST=$(date +%s) --build-arg GIT_COMMIT=$GIT_BRANCH --build-arg BASE_IMAGE=$BASE_TAG -t aitoolkit:$VERSION -f docker/Dockerfile .
 
 # Tag with version and latest
 docker tag aitoolkit:$VERSION pero4712/aitoolkit:$VERSION

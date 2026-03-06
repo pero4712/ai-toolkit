@@ -1,15 +1,29 @@
 #!/usr/bin/env bash
 
-echo "Building base image (only needed when dependencies change)..."
+# Compute a content hash from the base image inputs
+BASE_HASH=$(cat docker/Dockerfile.base requirements.txt | sha256sum | cut -c1-12)
+BASE_TAG="pero4712/aitoolkit-base:$BASE_HASH"
+
+echo "Base image tag: $BASE_TAG"
+
+# Check if this base image already exists on Docker Hub
+if docker manifest inspect "$BASE_TAG" > /dev/null 2>&1; then
+    echo "Base image $BASE_TAG already exists on Docker Hub. Skipping build."
+    exit 0
+fi
+
+echo "Base image not found on Docker Hub. Building..."
 sleep 2
 
 # Build the base image
-docker build -t aitoolkit-base:latest -f docker/Dockerfile.base .
+docker build -t "$BASE_TAG" -f docker/Dockerfile.base .
 
-# Tag and push
-docker tag aitoolkit-base:latest pero4712/aitoolkit-base:latest
+# Also tag as latest
+docker tag "$BASE_TAG" pero4712/aitoolkit-base:latest
 
+# Push both tags
 echo "Pushing base image to Docker Hub..."
+docker push "$BASE_TAG"
 docker push pero4712/aitoolkit-base:latest
 
-echo "Successfully built and pushed pero4712/aitoolkit-base:latest"
+echo "Successfully built and pushed $BASE_TAG"
