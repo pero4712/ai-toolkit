@@ -18,7 +18,9 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   const snapshotPath = path.join(trainingFolder, job.name, 'loss_analysis.json');
 
   if (!fs.existsSync(snapshotPath)) {
-    return NextResponse.json({ available: false });
+    const jsonlPath = path.join(trainingFolder, job.name, 'loss_events.jsonl');
+    const enabled = fs.existsSync(jsonlPath);
+    return NextResponse.json({ available: false, enabled });
   }
 
   try {

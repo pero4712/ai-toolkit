@@ -27,6 +27,7 @@ export interface SummaryRow {
 
 export interface LossAnalysisData {
   available: boolean;
+  enabled?: boolean;
   step?: number;
   wall_time?: number;
   run_id?: string;

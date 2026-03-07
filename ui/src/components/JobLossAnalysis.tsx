@@ -67,11 +67,20 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
   if (!data.available) {
     return (
       <div className="flex flex-col items-center justify-center h-64 text-gray-400 space-y-2">
-        <p className="text-sm">No loss analysis data yet.</p>
-        <p className="text-xs">
-          Enable <code className="bg-gray-800 px-1 rounded">structured_loss: true</code> in your
-          logging config and wait for the first periodic snapshot.
-        </p>
+        {data.enabled ? (
+          <>
+            <p className="text-sm">Structured loss logging is enabled.</p>
+            <p className="text-xs">Waiting for the first periodic snapshot...</p>
+          </>
+        ) : (
+          <>
+            <p className="text-sm">Structured loss logging is not enabled.</p>
+            <p className="text-xs">
+              Add <code className="bg-gray-800 px-1 rounded">structured_loss: true</code> under
+              the <code className="bg-gray-800 px-1 rounded">logging</code> section in your process config.
+            </p>
+          </>
+        )}
       </div>
     );
   }
