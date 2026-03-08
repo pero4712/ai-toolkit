@@ -10,6 +10,13 @@ export interface WorstVideo {
   mean_loss_raw: number;
   p90_loss_final: number;
   count: number;
+  z_score?: number;
+  is_outlier?: boolean;
+  is_new_outlier?: boolean;
+  trend?: 'up' | 'down' | 'flat' | '~';
+  trend_delta?: number;
+  loss_ratio?: number;
+  caption?: string | null;
 }
 
 export interface MatrixCell {
@@ -23,6 +30,11 @@ export interface SummaryRow {
   name: string;
   ema_200: number;
   sample_count: number;
+  std_loss?: number;
+  min_loss?: number;
+  max_loss?: number;
+  clip_count?: number;
+  relative_difficulty?: number;
 }
 
 export interface LossAnalysisData {
@@ -49,6 +61,11 @@ export interface LossAnalysisData {
   samples_total?: number;
   samples_concept_total?: number;
   samples_reg_total?: number;
+  // Per-group worst clips
+  worst_by_group_concept?: Record<string, WorstVideo[]>;
+  worst_by_group_reg?: Record<string, WorstVideo[]>;
+  // Group-level stats
+  group_stats?: Record<string, { mean: number; std: number; min: number; max: number; clip_count: number }>;
 }
 
 export default function useJobLossAnalysis(

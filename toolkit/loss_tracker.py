@@ -64,6 +64,9 @@ class LossLoggingConfig:
     max_tracked_videos: int = 2000
     worst_min_count: int = 10     # min samples before video appears in worst list
     noise_bucket_edges: Optional[List[int]] = None
+    loss_outlier_sigma: float = 2.0   # z-score threshold for [OUTLIER] flag
+    worst_per_group_n: int = 5        # top-N worst clips per group
+    caption_max_len: int = 80         # truncated caption length stored on VideoStats
 
     @classmethod
     def from_logging_config(cls, lc: Any) -> "LossLoggingConfig":
@@ -78,6 +81,9 @@ class LossLoggingConfig:
             max_tracked_videos=getattr(lc, "structured_loss_max_videos", 2000),
             worst_min_count=getattr(lc, "structured_loss_worst_min_count", 10),
             noise_bucket_edges=edges,
+            loss_outlier_sigma=getattr(lc, "structured_loss_outlier_sigma", 2.0),
+            worst_per_group_n=getattr(lc, "structured_loss_worst_per_group", 5),
+            caption_max_len=getattr(lc, "structured_loss_caption_len", 80),
         )
 
 
@@ -143,6 +149,10 @@ class VideoStats:
         "sum_raw",
         "total_count",
         "last_seen_step",
+        "caption",
+        "trend_means",
+        "trend_steps",
+        "was_outlier",
     )
 
     def __init__(
@@ -165,6 +175,10 @@ class VideoStats:
         self.sum_raw = 0.0
         self.total_count = 0
         self.last_seen_step = 0
+        self.caption: Optional[str] = None
+        self.trend_means: List[float] = []
+        self.trend_steps: List[int] = []
+        self.was_outlier: bool = False
 
     def add(self, loss_final: float, loss_raw: float, step: int) -> None:
         if self.count >= len(self.losses):
@@ -194,6 +208,53 @@ class VideoStats:
         vals = sorted(self.losses[: self.count])
         k = max(1, math.ceil(0.9 * self.count))
         return vals[k - 1]
+
+    def record_trend(self, step: int) -> None:
+        """Snapshot current mean for trend tracking. Skips if already recorded at this step."""
+        if self.trend_steps and self.trend_steps[-1] == step:
+            return
+        self.trend_means.append(self.mean)
+        self.trend_steps.append(step)
+        if len(self.trend_means) > 5:
+            self.trend_means.pop(0)
+            self.trend_steps.pop(0)
+
+    @property
+    def trend_slope(self) -> float:
+        """Normalized linear regression slope over trend_means.
+
+        Returns slope / abs(y_mean) for scale-independent classification.
+        Returns 0.0 if fewer than 2 data points.
+        """
+        n = len(self.trend_means)
+        if n < 2:
+            return 0.0
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(self.trend_means) / n
+        num = sum((i - x_mean) * (y - y_mean) for i, y in enumerate(self.trend_means))
+        den = sum((i - x_mean) ** 2 for i in range(n))
+        if den == 0:
+            return 0.0
+        raw_slope = num / den
+        return raw_slope / max(abs(y_mean), 1e-6)
+
+    def trend_direction(self, min_count: int) -> str:
+        """Classify trend as up/down/flat/~ based on normalized slope."""
+        if self.total_count < min_count or len(self.trend_means) < 2:
+            return "~"
+        slope = self.trend_slope
+        if slope > 0.01:
+            return "up"
+        elif slope < -0.01:
+            return "down"
+        return "flat"
+
+    @property
+    def trend_delta(self) -> float:
+        """Absolute change from oldest to newest trend point."""
+        if len(self.trend_means) < 2:
+            return 0.0
+        return self.trend_means[-1] - self.trend_means[0]
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +304,9 @@ class LossTracker:
         self._sanitized_names: Dict[str, str] = {}
         # Reverse lookup: sanitized key → original (first registrant)
         self._sanitized_reverse: Dict[str, str] = {}
+
+        # Cached group stats (rebuilt at snapshot time)
+        self._cached_group_stats: Dict[Tuple[str, bool], Dict[str, Any]] = {}
 
         # Step-level buffer
         self._current_step_events: List[LossEvent] = []
@@ -453,7 +517,10 @@ class LossTracker:
             self._video_stats[vid_key] = VideoStats(
                 event.source_id, event.dataset_group, g_key, event.is_reg, window=50
             )
-        self._video_stats[vid_key].add(event.loss_final, event.loss_raw, step)
+        vs = self._video_stats[vid_key]
+        vs.add(event.loss_final, event.loss_raw, step)
+        if vs.caption is None and event.caption:
+            vs.caption = " ".join(event.caption.split())[:self.config.caption_max_len]
 
     def get_worst_videos(
         self, top_n: int = 20, is_reg: Optional[bool] = False,
@@ -488,31 +555,191 @@ class LossTracker:
         return result
 
     # -----------------------------------------------------------------------
+    # Group stats & extended diagnostics
+    # -----------------------------------------------------------------------
+
+    def _cache_group_stats(self) -> None:
+        """Compute per-group stats from current clip rolling means.
+
+        Stored as self._cached_group_stats: {(g_key, is_reg): {mean, std, min, max, clip_count}}.
+        Called at the start of each snapshot cycle.
+        """
+        from collections import defaultdict as _dd
+        clips_by_group: Dict[Tuple[str, bool], List[float]] = _dd(list)
+        for v in self._video_stats.values():
+            if v.total_count >= self.config.worst_min_count:
+                clips_by_group[(v.dataset_group_key, v.is_reg)].append(v.mean)
+
+        stats: Dict[Tuple[str, bool], Dict[str, float]] = {}
+        for key, means in clips_by_group.items():
+            n = len(means)
+            avg = sum(means) / n
+            if n >= 2:
+                var = sum((m - avg) ** 2 for m in means) / (n - 1)
+                std = math.sqrt(var)
+            else:
+                std = 0.0
+            stats[key] = {
+                "mean": avg,
+                "std": std,
+                "effective_std": max(std, avg * 0.05, 0.001),
+                "min": min(means),
+                "max": max(means),
+                "clip_count": n,
+            }
+        self._cached_group_stats = stats
+
+    def _record_all_trends(self, step: int) -> None:
+        """Record trend snapshot for all eligible clips."""
+        for vs in self._video_stats.values():
+            if vs.total_count >= self.config.worst_min_count:
+                vs.record_trend(step)
+
+    def _compute_clip_diagnostics(self, vs: VideoStats) -> Dict[str, Any]:
+        """Compute z-score, outlier status, trend, and loss_ratio for a single clip."""
+        g_stats = self._cached_group_stats.get((vs.dataset_group_key, vs.is_reg))
+        if g_stats:
+            g_mean = g_stats["mean"]
+            eff_std = g_stats["effective_std"]
+            z = (vs.mean - g_mean) / eff_std
+            loss_ratio = vs.mean / max(g_mean, 1e-6)
+        else:
+            z = 0.0
+            g_mean = 0.0
+            loss_ratio = 0.0
+
+        # Outlier detection with hysteresis
+        sigma = self.config.loss_outlier_sigma
+        if not vs.was_outlier:
+            is_outlier = z > sigma
+        else:
+            is_outlier = z >= sigma * 0.8
+        is_new_outlier = is_outlier and not vs.was_outlier
+        vs.was_outlier = is_outlier
+
+        trend = vs.trend_direction(self.config.worst_min_count)
+
+        return {
+            "source_id": vs.source_id,
+            "dataset_group": vs.dataset_group,
+            "mean_loss_final": round(vs.mean, 6),
+            "mean_loss_raw": round(vs.mean_raw, 6),
+            "p90_loss_final": round(vs.p90, 6),
+            "count": vs.total_count,
+            "z_score": round(z, 2),
+            "is_outlier": is_outlier,
+            "is_new_outlier": is_new_outlier,
+            "trend": trend,
+            "trend_slope": round(vs.trend_slope, 6),
+            "trend_delta": round(vs.trend_delta, 6),
+            "loss_ratio": round(loss_ratio, 3),
+            "caption": vs.caption,
+        }
+
+    def get_worst_videos_extended(
+        self, top_n: int = 20, is_reg: Optional[bool] = False,
+    ) -> List[Dict[str, Any]]:
+        """Like get_worst_videos but returns dicts with z-score, trend, caption.
+
+        Requires _cache_group_stats() to have been called first.
+        """
+        eligible = [
+            v for v in self._video_stats.values()
+            if v.total_count >= self.config.worst_min_count
+            and (is_reg is None or v.is_reg == is_reg)
+        ]
+        eligible.sort(key=lambda v: v.mean, reverse=True)
+        return [self._compute_clip_diagnostics(v) for v in eligible[:top_n]]
+
+    def get_worst_by_group(
+        self, top_n: Optional[int] = None, is_reg: Optional[bool] = False,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Return worst videos per group, sorted by z_score desc.
+
+        Requires _cache_group_stats() to have been called first.
+        """
+        if top_n is None:
+            top_n = self.config.worst_per_group_n
+
+        eligible = [
+            v for v in self._video_stats.values()
+            if v.total_count >= self.config.worst_min_count
+            and (is_reg is None or v.is_reg == is_reg)
+        ]
+
+        by_group: Dict[str, List[VideoStats]] = defaultdict(list)
+        for v in eligible:
+            by_group[v.dataset_group].append(v)
+
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for group, clips in sorted(by_group.items()):
+            # Compute diagnostics for all clips in this group
+            diags = [self._compute_clip_diagnostics(v) for v in clips]
+            # Sort by z_score desc, then trend_slope desc, then mean desc
+            diags.sort(key=lambda d: (-d["z_score"], -d.get("trend_slope", 0.0), -d["mean_loss_final"]))
+            result[group] = diags[:top_n]
+
+        return result
+
+    # -----------------------------------------------------------------------
     # Periodic tables
     # -----------------------------------------------------------------------
 
-    def _print_worst_videos(self, step: int, label: str, worst: list) -> None:
-        """Print a worst-videos table to console."""
+    def _print_worst_videos_extended(self, step: int, label: str, worst: List[Dict[str, Any]]) -> None:
+        """Print a worst-videos table with z-score, trend, ratio, caption."""
         if not worst:
             return
+        trend_chars = {"up": "\u2191", "down": "\u2193", "flat": "\u2192", "~": "~"}
         print(f"\n[LossTracker] Worst {label} videos at step {step}:")
-        print(f"  {'source_id':<10} {'group':<20} {'mean':>8} {'p90':>8} {'count':>6}")
-        for sid, grp, mean_f, _mean_r, p90, cnt in worst:
-            print(f"  {sid:<10} {grp:<20} {mean_f:>8.5f} {p90:>8.5f} {cnt:>6}")
+        print(f"  {'source_id':<10} {'group':<16} {'mean':>8} {'p90':>8} {'z':>8} {'r':>5} {'t':>2} {'cnt':>5}  caption")
+        outlier_count = 0
+        new_outlier_count = 0
+        for w in worst:
+            flag = ""
+            z_suffix = ""
+            if w.get("is_new_outlier"):
+                flag = "  [NEW OUTLIER]"
+                z_suffix = "!!"
+                new_outlier_count += 1
+                outlier_count += 1
+            elif w.get("is_outlier"):
+                flag = "  [OUTLIER]"
+                z_suffix = "!"
+                outlier_count += 1
+            trend = trend_chars.get(w.get("trend", "~"), "~")
+            cap = (w.get("caption") or "")[:40]
+            if w.get("z_score") is not None:
+                z_str = f"{w['z_score']:.1f}{z_suffix}"
+                z_str = f"{z_str:>8}"
+            else:
+                z_str = "       -"
+            r_str = f"{w['loss_ratio']:>5.2f}" if w.get("loss_ratio") else "    -"
+            print(
+                f"  {w['source_id']:<10} {w['dataset_group']:<16} "
+                f"{w['mean_loss_final']:>8.5f} {w['p90_loss_final']:>8.5f} "
+                f"{z_str} {r_str} {trend:>2} {w['count']:>5}  {cap}{flag}"
+            )
+        if outlier_count > 0:
+            print(f"  [{outlier_count} outlier(s) (z > {self.config.loss_outlier_sigma}), {new_outlier_count} new]")
 
     def log_worst_videos_table(self, step: int, logger: Any) -> None:
-        concept = self.get_worst_videos(top_n=20, is_reg=False)
-        reg = self.get_worst_videos(top_n=20, is_reg=True) if self._has_reg_data else []
-        if not concept and not reg:
+        # Ensure group stats are cached for z-score computation
+        self._record_all_trends(step)
+        self._cache_group_stats()
+
+        concept_ext = self.get_worst_videos_extended(top_n=20, is_reg=False)
+        reg_ext = self.get_worst_videos_extended(top_n=20, is_reg=True) if self._has_reg_data else []
+        if not concept_ext and not reg_ext:
             return
 
-        self._print_worst_videos(step, "concept", concept)
-        if reg:
-            self._print_worst_videos(step, "reg", reg)
+        self._print_worst_videos_extended(step, "concept", concept_ext)
+        if reg_ext:
+            self._print_worst_videos_extended(step, "reg", reg_ext)
         print()
 
-        # W&B table (concept only for default dashboard)
-        if concept and hasattr(logger, "_log"):
+        # W&B table (concept only, tuple format for compatibility)
+        concept_tuples = self.get_worst_videos(top_n=20, is_reg=False)
+        if concept_tuples and hasattr(logger, "_log"):
             try:
                 import wandb
 
@@ -527,7 +754,7 @@ class LossTracker:
                     ],
                     data=[
                         [sid, grp, mean_f, mean_r, p90, cnt]
-                        for sid, grp, mean_f, mean_r, p90, cnt in concept
+                        for sid, grp, mean_f, mean_r, p90, cnt in concept_tuples
                     ],
                 )
                 logger._log({"worst_videos": table}, commit=False)
@@ -723,6 +950,9 @@ class LossTracker:
         )
         print(f"  Noise buckets: low/mid/high (edges: {edge_str})")
         print(f"  Max tracked videos: {self.config.max_tracked_videos}")
+        print(f"  Outlier sigma: {self.config.loss_outlier_sigma}")
+        print(f"  Worst per group: {self.config.worst_per_group_n}")
+        print(f"  Caption max len: {self.config.caption_max_len}")
         print(f"  Debug payloads: {'on' if self.config.debug else 'off'}")
         print()
 
@@ -731,18 +961,8 @@ class LossTracker:
     # -----------------------------------------------------------------------
 
     def _worst_videos_snapshot(self, is_reg: Optional[bool]) -> list:
-        """Format worst videos for JSON snapshot."""
-        return [
-            {
-                "source_id": sid,
-                "dataset_group": grp,
-                "mean_loss_final": round(mf, 6),
-                "mean_loss_raw": round(mr, 6),
-                "p90_loss_final": round(p90, 6),
-                "count": cnt,
-            }
-            for sid, grp, mf, mr, p90, cnt in self.get_worst_videos(top_n=20, is_reg=is_reg)
-        ]
+        """Format worst videos for JSON snapshot (extended format)."""
+        return self.get_worst_videos_extended(top_n=20, is_reg=is_reg)
 
     def _summary_snapshot(self, is_reg: Optional[bool]) -> list:
         """Format summary rows for JSON snapshot.
@@ -750,18 +970,30 @@ class LossTracker:
         Args:
             is_reg: False = concept, True = reg, None = combined (all).
         """
+        # Compute global EMA for relative difficulty
+        global_ema = self._ema_200.value if self._ema_200.value > 0 else 1.0
+
         rows = []
         for (g_key, reg), g_ema in sorted(self._group_emas_by_reg.items()):
             if is_reg is not None and reg != is_reg:
                 continue
             orig_name = self._sanitized_reverse.get(g_key, g_key)
             sample_count = self._group_sample_counts_by_reg.get((g_key, reg), 0)
-            rows.append({
+            row: Dict[str, Any] = {
                 "type": "group",
                 "name": orig_name,
                 "ema_200": round(g_ema.value, 6),
                 "sample_count": sample_count,
-            })
+            }
+            # Enrich with cached group stats if available
+            g_stats = getattr(self, "_cached_group_stats", {}).get((g_key, reg))
+            if g_stats:
+                row["std_loss"] = round(g_stats["std"], 6)
+                row["min_loss"] = round(g_stats["min"], 6)
+                row["max_loss"] = round(g_stats["max"], 6)
+                row["clip_count"] = g_stats["clip_count"]
+                row["relative_difficulty"] = round(g_ema.value / global_ema, 4)
+            rows.append(row)
         for (b_key, reg), b_ema in sorted(self._bucket_emas_by_reg.items()):
             if is_reg is not None and reg != is_reg:
                 continue
@@ -804,8 +1036,28 @@ class LossTracker:
             "ema_1000": round(self._reg_ema_1000[is_reg].value, 6),
         }
 
+    def _group_stats_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Format group stats for JSON snapshot (external analysis scripts)."""
+        result = {}
+        for (g_key, is_reg), stats in getattr(self, "_cached_group_stats", {}).items():
+            if is_reg:
+                continue  # concept-only for the top-level group_stats
+            orig_name = self._sanitized_reverse.get(g_key, g_key)
+            result[orig_name] = {
+                "mean": round(stats["mean"], 6),
+                "std": round(stats["std"], 6),
+                "min": round(stats["min"], 6),
+                "max": round(stats["max"], 6),
+                "clip_count": stats["clip_count"],
+            }
+        return result
+
     def _write_snapshot(self, step: int) -> None:
         """Write a JSON snapshot of current tables for the web UI."""
+        # Record trends and cache group stats before building snapshot
+        self._record_all_trends(step)
+        self._cache_group_stats()
+
         samples_total = self._samples_total_by_reg[False] + self._samples_total_by_reg[True]
 
         snapshot: Dict[str, Any] = {
@@ -833,6 +1085,13 @@ class LossTracker:
             "ema_concept": self._ema_snapshot(is_reg=False),
             "ema_reg": self._ema_snapshot(is_reg=True),
             "has_reg_data": self._has_reg_data,
+
+            # Per-group worst clips
+            "worst_by_group_concept": self.get_worst_by_group(is_reg=False),
+            "worst_by_group_reg": self.get_worst_by_group(is_reg=True) if self._has_reg_data else {},
+
+            # Group-level stats for external analysis
+            "group_stats": self._group_stats_snapshot(),
 
             # Sample totals
             "samples_total": samples_total,

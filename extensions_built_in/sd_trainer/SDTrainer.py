@@ -900,7 +900,7 @@ class SDTrainer(BaseSDTrainProcess):
                         token_dropout_rate=ds_cfg.token_dropout_rate,
                         caption_dropout_rate=ds_cfg.caption_dropout_rate,
                         is_caption_dropped=bool(prompt_i.strip() == ""),
-                        caption=prompt_i if self.loss_tracker.config.debug else None,
+                        caption=" ".join(prompt_i.split())[:self.loss_tracker.config.caption_max_len] if prompt_i else None,
                     ))
             del _loss_raw_snap
 
