@@ -133,6 +133,8 @@ class VideoStats:
     __slots__ = (
         "source_id",
         "dataset_group",
+        "dataset_group_key",
+        "is_reg",
         "losses",
         "losses_raw",
         "idx",
@@ -147,10 +149,14 @@ class VideoStats:
         self,
         source_id: str,
         dataset_group: str,
+        dataset_group_key: str,
+        is_reg: bool,
         window: int = 50,
     ) -> None:
         self.source_id = source_id
-        self.dataset_group = dataset_group  # original unsanitized
+        self.dataset_group = dataset_group        # original human-friendly name
+        self.dataset_group_key = dataset_group_key  # sanitized metric key
+        self.is_reg = is_reg
         self.losses: List[float] = [0.0] * window
         self.losses_raw: List[float] = [0.0] * window
         self.idx = 0
@@ -204,22 +210,34 @@ class LossTracker:
         self._ema_200 = EMAScalar(span=200)
         self._ema_1000 = EMAScalar(span=1000)
 
-        # Per-group EMAs  (sanitized key → EMA)
-        self._group_emas: Dict[str, EMAScalar] = {}
-        # Per-noise-bucket EMAs
-        self._bucket_emas: Dict[str, EMAScalar] = {}
-        # Per-boundary EMAs (WAN 14B multistage)
-        self._boundary_emas: Dict[int, EMAScalar] = {}
+        # Reg/concept split EMAs (keyed by is_reg bool)
+        self._reg_ema_50: Dict[bool, EMAScalar] = {False: EMAScalar(50), True: EMAScalar(50)}
+        self._reg_ema_200: Dict[bool, EMAScalar] = {False: EMAScalar(200), True: EMAScalar(200)}
+        self._reg_ema_1000: Dict[bool, EMAScalar] = {False: EMAScalar(1000), True: EMAScalar(1000)}
 
-        # Per-(group, bucket) matrix EMAs for cross-tabulation
-        self._matrix_emas: Dict[Tuple[str, str], EMAScalar] = {}
-        # Cumulative sample counts for summary table
-        self._group_sample_counts: Dict[str, int] = defaultdict(int)
-        self._bucket_sample_counts: Dict[str, int] = defaultdict(int)
-        self._boundary_sample_counts: Dict[int, int] = defaultdict(int)
+        # Per-group EMAs split by is_reg: (sanitized_key, is_reg) → EMA
+        self._group_emas_by_reg: Dict[Tuple[str, bool], EMAScalar] = {}
+        self._group_sample_counts_by_reg: Dict[Tuple[str, bool], int] = defaultdict(int)
 
-        # Per-video tracking (bounded)
-        self._video_stats: Dict[str, VideoStats] = {}
+        # Per-noise-bucket split: (bucket, is_reg) → EMA
+        self._bucket_emas_by_reg: Dict[Tuple[str, bool], EMAScalar] = {}
+        self._bucket_sample_counts_by_reg: Dict[Tuple[str, bool], int] = defaultdict(int)
+
+        # Per-boundary split: (bidx, is_reg) → EMA
+        self._boundary_emas_by_reg: Dict[Tuple[int, bool], EMAScalar] = {}
+        self._boundary_sample_counts_by_reg: Dict[Tuple[int, bool], int] = defaultdict(int)
+
+        # Per-(group, bucket, is_reg) matrix EMAs for cross-tabulation
+        self._matrix_emas_by_reg: Dict[Tuple[str, str, bool], EMAScalar] = {}
+
+        # Whether any reg data has been seen
+        self._has_reg_data = False
+
+        # Cumulative sample totals by is_reg
+        self._samples_total_by_reg: Dict[bool, int] = {False: 0, True: 0}
+
+        # Per-video tracking (bounded), keyed by (source_id, is_reg)
+        self._video_stats: Dict[Tuple[str, bool], VideoStats] = {}
 
         # Collision-safe name registry: original → sanitized key
         self._sanitized_names: Dict[str, str] = {}
@@ -312,65 +330,97 @@ class LossTracker:
             "loss_tracker/step_time_ms": step_time_ms,
         }
 
-        # Per-group breakdown
-        group_losses: Dict[str, List[float]] = defaultdict(list)
+        # ---- Partition events by is_reg ----
+        events_by_reg: Dict[bool, List[LossEvent]] = defaultdict(list)
         for e in events:
-            group_losses[e.dataset_group].append(e.loss_final)
+            events_by_reg[e.is_reg].append(e)
+        if True in events_by_reg:
+            self._has_reg_data = True
 
-        for group, losses in group_losses.items():
-            g_key = self._get_sanitized_group(group)
-            g_mean = sum(losses) / len(losses)
-            if g_key not in self._group_emas:
-                self._group_emas[g_key] = EMAScalar(span=200)
-            self._group_emas[g_key].update(g_mean)
-            metrics[f"loss_by_group_ema/{g_key}"] = self._group_emas[g_key].value
-            metrics[f"samples_by_group/{g_key}"] = float(len(losses))
+        for is_reg, split_events in events_by_reg.items():
+            reg_tag = "reg" if is_reg else "concept"
+            split_mean = sum(e.loss_final for e in split_events) / len(split_events)
 
-        # Per-noise-bucket breakdown
-        bucket_losses: Dict[str, List[float]] = defaultdict(list)
-        for e in events:
-            bucket_losses[e.timestep_bucket].append(e.loss_final)
+            # Cumulative totals
+            self._samples_total_by_reg[is_reg] += len(split_events)
 
-        for bucket, losses in bucket_losses.items():
-            b_mean = sum(losses) / len(losses)
-            if bucket not in self._bucket_emas:
-                self._bucket_emas[bucket] = EMAScalar(span=200)
-            self._bucket_emas[bucket].update(b_mean)
-            metrics[f"loss_by_noise_ema/{bucket}"] = self._bucket_emas[bucket].value
-            metrics[f"samples_by_noise/{bucket}"] = float(len(losses))
+            # Overall reg/concept EMA
+            self._reg_ema_50[is_reg].update(split_mean)
+            self._reg_ema_200[is_reg].update(split_mean)
+            self._reg_ema_1000[is_reg].update(split_mean)
+            metrics[f"loss_by_reg_ema/{reg_tag}"] = self._reg_ema_200[is_reg].value
+            metrics[f"samples_by_reg/{reg_tag}"] = float(len(split_events))
 
-        # Per-boundary breakdown (multistage only)
-        boundary_losses: Dict[int, List[float]] = defaultdict(list)
-        for e in events:
-            if e.boundary_index is not None:
-                boundary_losses[e.boundary_index].append(e.loss_final)
+            # Per-group breakdown (concept = default keys, reg = _reg_ keys)
+            group_losses: Dict[str, List[float]] = defaultdict(list)
+            for e in split_events:
+                group_losses[e.dataset_group].append(e.loss_final)
+            for group, losses in group_losses.items():
+                g_key = self._get_sanitized_group(group)
+                key = (g_key, is_reg)
+                if key not in self._group_emas_by_reg:
+                    self._group_emas_by_reg[key] = EMAScalar(span=200)
+                self._group_emas_by_reg[key].update(sum(losses) / len(losses))
+                self._group_sample_counts_by_reg[key] += len(losses)
+                if is_reg:
+                    metrics[f"loss_by_group_reg_ema/{g_key}"] = self._group_emas_by_reg[key].value
+                    metrics[f"samples_by_group_reg/{g_key}"] = float(len(losses))
+                else:
+                    metrics[f"loss_by_group_ema/{g_key}"] = self._group_emas_by_reg[key].value
+                    metrics[f"samples_by_group/{g_key}"] = float(len(losses))
 
-        for bidx, losses in boundary_losses.items():
-            b_mean = sum(losses) / len(losses)
-            if bidx not in self._boundary_emas:
-                self._boundary_emas[bidx] = EMAScalar(span=200)
-            self._boundary_emas[bidx].update(b_mean)
-            metrics[f"loss_by_boundary/{bidx}"] = self._boundary_emas[bidx].value
+            # Per-noise-bucket breakdown
+            bucket_losses: Dict[str, List[float]] = defaultdict(list)
+            for e in split_events:
+                bucket_losses[e.timestep_bucket].append(e.loss_final)
+            for bucket, losses in bucket_losses.items():
+                key = (bucket, is_reg)
+                if key not in self._bucket_emas_by_reg:
+                    self._bucket_emas_by_reg[key] = EMAScalar(span=200)
+                self._bucket_emas_by_reg[key].update(sum(losses) / len(losses))
+                self._bucket_sample_counts_by_reg[key] += len(losses)
+                if is_reg:
+                    metrics[f"loss_by_noise_reg_ema/{bucket}"] = self._bucket_emas_by_reg[key].value
+                    metrics[f"samples_by_noise_reg/{bucket}"] = float(len(losses))
+                else:
+                    metrics[f"loss_by_noise_ema/{bucket}"] = self._bucket_emas_by_reg[key].value
+                    metrics[f"samples_by_noise/{bucket}"] = float(len(losses))
 
-        # Group × bucket matrix EMAs
-        cell_losses: Dict[Tuple[str, str], List[float]] = defaultdict(list)
-        for e in events:
-            g_key = self._get_sanitized_group(e.dataset_group)
-            cell_losses[(g_key, e.timestep_bucket)].append(e.loss_final)
-        for (g_key, b_key), losses in cell_losses.items():
-            cell_mean = sum(losses) / len(losses)
-            if (g_key, b_key) not in self._matrix_emas:
-                self._matrix_emas[(g_key, b_key)] = EMAScalar(span=200)
-            self._matrix_emas[(g_key, b_key)].update(cell_mean)
+            # Per-boundary breakdown (multistage only)
+            boundary_losses: Dict[int, List[float]] = defaultdict(list)
+            for e in split_events:
+                if e.boundary_index is not None:
+                    boundary_losses[e.boundary_index].append(e.loss_final)
+            for bidx, losses in boundary_losses.items():
+                key = (bidx, is_reg)
+                if key not in self._boundary_emas_by_reg:
+                    self._boundary_emas_by_reg[key] = EMAScalar(span=200)
+                self._boundary_emas_by_reg[key].update(sum(losses) / len(losses))
+                self._boundary_sample_counts_by_reg[key] += len(losses)
+                if is_reg:
+                    metrics[f"loss_by_boundary_reg/{bidx}"] = self._boundary_emas_by_reg[key].value
+                    metrics[f"samples_by_boundary_reg/{bidx}"] = float(len(losses))
+                else:
+                    metrics[f"loss_by_boundary/{bidx}"] = self._boundary_emas_by_reg[key].value
+                    metrics[f"samples_by_boundary/{bidx}"] = float(len(losses))
 
-        # Cumulative sample counts for summary table
-        for group, losses in group_losses.items():
-            g_key = self._get_sanitized_group(group)
-            self._group_sample_counts[g_key] += len(losses)
-        for bucket, losses in bucket_losses.items():
-            self._bucket_sample_counts[bucket] += len(losses)
-        for bidx, losses in boundary_losses.items():
-            self._boundary_sample_counts[bidx] += len(losses)
+            # Group × bucket matrix EMAs
+            for e in split_events:
+                g_key = self._get_sanitized_group(e.dataset_group)
+                key = (g_key, e.timestep_bucket, is_reg)
+                if key not in self._matrix_emas_by_reg:
+                    self._matrix_emas_by_reg[key] = EMAScalar(span=200)
+                self._matrix_emas_by_reg[key].update(e.loss_final)
+
+        # Ratio metrics (only when both sides have data this step)
+        concept_count = len(events_by_reg.get(False, []))
+        reg_count = len(events_by_reg.get(True, []))
+        if concept_count > 0 and reg_count > 0:
+            metrics["loss_ratio/reg_to_concept"] = (
+                self._reg_ema_200[True].value
+                / max(self._reg_ema_200[False].value, 1e-10)
+            )
+            metrics["samples_ratio/reg_to_concept"] = float(reg_count) / float(concept_count)
 
         # Per-video tracking
         for e in events:
@@ -387,8 +437,8 @@ class LossTracker:
     # -----------------------------------------------------------------------
 
     def _update_video_stats(self, event: LossEvent, step: int) -> None:
-        sid = event.source_id
-        if sid not in self._video_stats:
+        vid_key = (event.source_id, event.is_reg)
+        if vid_key not in self._video_stats:
             if len(self._video_stats) >= self.config.max_tracked_videos:
                 # Evict: lowest total_count, tiebreaker oldest last_seen_step
                 evict_key = min(
@@ -399,15 +449,21 @@ class LossTracker:
                     ),
                 )
                 del self._video_stats[evict_key]
-            self._video_stats[sid] = VideoStats(
-                sid, event.dataset_group, window=50
+            g_key = self._get_sanitized_group(event.dataset_group)
+            self._video_stats[vid_key] = VideoStats(
+                event.source_id, event.dataset_group, g_key, event.is_reg, window=50
             )
-        self._video_stats[sid].add(event.loss_final, event.loss_raw, step)
+        self._video_stats[vid_key].add(event.loss_final, event.loss_raw, step)
 
     def get_worst_videos(
-        self, top_n: int = 20
+        self, top_n: int = 20, is_reg: Optional[bool] = False,
     ) -> List[Tuple[str, str, float, float, float, int]]:
         """Return worst videos by rolling mean loss_final.
+
+        Args:
+            top_n: Maximum number of videos to return.
+            is_reg: Filter by reg status.  False = concept only (default),
+                    True = reg only, None = all videos.
 
         Returns list of (source_id, dataset_group, mean_final, mean_raw,
         p90_final, total_count).  Filtered to total_count >= worst_min_count.
@@ -416,6 +472,7 @@ class LossTracker:
             v
             for v in self._video_stats.values()
             if v.total_count >= self.config.worst_min_count
+            and (is_reg is None or v.is_reg == is_reg)
         ]
         eligible.sort(key=lambda v: v.mean, reverse=True)
         result = []
@@ -434,20 +491,28 @@ class LossTracker:
     # Periodic tables
     # -----------------------------------------------------------------------
 
-    def log_worst_videos_table(self, step: int, logger: Any) -> None:
-        worst = self.get_worst_videos(top_n=20)
+    def _print_worst_videos(self, step: int, label: str, worst: list) -> None:
+        """Print a worst-videos table to console."""
         if not worst:
             return
-
-        # Console output
-        print(f"\n[LossTracker] Worst videos at step {step}:")
+        print(f"\n[LossTracker] Worst {label} videos at step {step}:")
         print(f"  {'source_id':<10} {'group':<20} {'mean':>8} {'p90':>8} {'count':>6}")
         for sid, grp, mean_f, _mean_r, p90, cnt in worst:
             print(f"  {sid:<10} {grp:<20} {mean_f:>8.5f} {p90:>8.5f} {cnt:>6}")
+
+    def log_worst_videos_table(self, step: int, logger: Any) -> None:
+        concept = self.get_worst_videos(top_n=20, is_reg=False)
+        reg = self.get_worst_videos(top_n=20, is_reg=True) if self._has_reg_data else []
+        if not concept and not reg:
+            return
+
+        self._print_worst_videos(step, "concept", concept)
+        if reg:
+            self._print_worst_videos(step, "reg", reg)
         print()
 
-        # W&B table
-        if hasattr(logger, "_log"):
+        # W&B table (concept only for default dashboard)
+        if concept and hasattr(logger, "_log"):
             try:
                 import wandb
 
@@ -462,7 +527,7 @@ class LossTracker:
                     ],
                     data=[
                         [sid, grp, mean_f, mean_r, p90, cnt]
-                        for sid, grp, mean_f, mean_r, p90, cnt in worst
+                        for sid, grp, mean_f, mean_r, p90, cnt in concept
                     ],
                 )
                 logger._log({"worst_videos": table}, commit=False)
@@ -471,67 +536,98 @@ class LossTracker:
 
     def log_matrix_table(self, step: int, logger: Any) -> None:
         """Log group × noise bucket cross-tabulation as a W&B Table."""
-        if not self._matrix_emas:
+        if not self._matrix_emas_by_reg:
             return
 
-        rows = []
-        for (g_key, b_key), ema in sorted(self._matrix_emas.items()):
-            rows.append([g_key, b_key, ema.value])
+        # Build concept rows
+        concept_rows = []
+        for (g_key, b_key, is_reg), ema in sorted(self._matrix_emas_by_reg.items()):
+            orig_name = self._sanitized_reverse.get(g_key, g_key)
+            if not is_reg:
+                concept_rows.append([orig_name, b_key, ema.value])
 
         # Console
-        print(f"\n[LossTracker] Loss matrix at step {step}:")
-        print(f"  {'group':<20} {'bucket':<8} {'mean_loss':>10}")
-        for g, b, v in rows:
-            print(f"  {g:<20} {b:<8} {v:>10.6f}")
+        if concept_rows:
+            print(f"\n[LossTracker] Loss matrix (concept) at step {step}:")
+            print(f"  {'group':<20} {'bucket':<8} {'mean_loss':>10}")
+            for g, b, v in concept_rows:
+                print(f"  {g:<20} {b:<8} {v:>10.6f}")
+
+        if self._has_reg_data:
+            reg_rows = []
+            for (g_key, b_key, is_reg), ema in sorted(self._matrix_emas_by_reg.items()):
+                orig_name = self._sanitized_reverse.get(g_key, g_key)
+                if is_reg:
+                    reg_rows.append([orig_name, b_key, ema.value])
+            if reg_rows:
+                print(f"\n[LossTracker] Loss matrix (reg) at step {step}:")
+                print(f"  {'group':<20} {'bucket':<8} {'mean_loss':>10}")
+                for g, b, v in reg_rows:
+                    print(f"  {g:<20} {b:<8} {v:>10.6f}")
+
         print()
 
-        # W&B table
-        if hasattr(logger, "_log"):
+        # W&B table (concept only)
+        if concept_rows and hasattr(logger, "_log"):
             try:
                 import wandb
 
                 table = wandb.Table(
                     columns=["group", "noise_bucket", "mean_loss_final"],
-                    data=rows,
+                    data=concept_rows,
                 )
                 logger._log({"loss_matrix": table}, commit=False)
             except ImportError:
                 pass
 
+    def _build_summary_rows(self, is_reg: bool) -> list:
+        """Build summary rows for a given reg status."""
+        rows = []
+        for (g_key, reg), g_ema in sorted(self._group_emas_by_reg.items()):
+            if reg != is_reg:
+                continue
+            orig_name = self._sanitized_reverse.get(g_key, g_key)
+            rows.append(["group", orig_name, g_ema.value, self._group_sample_counts_by_reg.get((g_key, is_reg), 0)])
+        for (b_key, reg), b_ema in sorted(self._bucket_emas_by_reg.items()):
+            if reg != is_reg:
+                continue
+            rows.append(["noise", b_key, b_ema.value, self._bucket_sample_counts_by_reg.get((b_key, is_reg), 0)])
+        for (bidx, reg), b_ema in sorted(self._boundary_emas_by_reg.items()):
+            if reg != is_reg:
+                continue
+            rows.append(["boundary", str(bidx), b_ema.value, self._boundary_sample_counts_by_reg.get((bidx, is_reg), 0)])
+        return rows
+
     def log_summary_table(self, step: int, logger: Any) -> None:
         """At-a-glance health report: per-group and per-bucket stats with sample counts."""
-        rows = []
+        concept_rows = self._build_summary_rows(is_reg=False)
+        reg_rows = self._build_summary_rows(is_reg=True) if self._has_reg_data else []
 
-        # Group rows
-        for g_key, g_ema in sorted(self._group_emas.items()):
-            rows.append(["group", g_key, g_ema.value, self._group_sample_counts.get(g_key, 0)])
-
-        # Bucket rows
-        for b_key, b_ema in sorted(self._bucket_emas.items()):
-            rows.append(["noise", b_key, b_ema.value, self._bucket_sample_counts.get(b_key, 0)])
-
-        # Boundary rows
-        for bidx, b_ema in sorted(self._boundary_emas.items()):
-            rows.append(["boundary", str(bidx), b_ema.value, self._boundary_sample_counts.get(bidx, 0)])
-
-        if not rows:
+        if not concept_rows and not reg_rows:
             return
 
-        # Console
-        print(f"\n[LossTracker] Training summary at step {step}:")
-        print(f"  {'type':<10} {'name':<20} {'ema_200':>10} {'samples':>8}")
-        for typ, name, val, cnt in rows:
-            print(f"  {typ:<10} {name:<20} {val:>10.6f} {cnt:>8}")
+        if concept_rows:
+            print(f"\n[LossTracker] Training summary (concept) at step {step}:")
+            print(f"  {'type':<10} {'name':<20} {'ema_200':>10} {'samples':>8}")
+            for typ, name, val, cnt in concept_rows:
+                print(f"  {typ:<10} {name:<20} {val:>10.6f} {cnt:>8}")
+
+        if reg_rows:
+            print(f"\n[LossTracker] Training summary (reg) at step {step}:")
+            print(f"  {'type':<10} {'name':<20} {'ema_200':>10} {'samples':>8}")
+            for typ, name, val, cnt in reg_rows:
+                print(f"  {typ:<10} {name:<20} {val:>10.6f} {cnt:>8}")
+
         print()
 
-        # W&B table
-        if hasattr(logger, "_log"):
+        # W&B table (concept only for default dashboard)
+        if concept_rows and hasattr(logger, "_log"):
             try:
                 import wandb
 
                 table = wandb.Table(
                     columns=["type", "name", "ema_200", "sample_count"],
-                    data=rows,
+                    data=concept_rows,
                 )
                 logger._log({"training_summary": table}, commit=False)
             except ImportError:
@@ -634,61 +730,115 @@ class LossTracker:
     # Snapshot for web UI
     # -----------------------------------------------------------------------
 
+    def _worst_videos_snapshot(self, is_reg: Optional[bool]) -> list:
+        """Format worst videos for JSON snapshot."""
+        return [
+            {
+                "source_id": sid,
+                "dataset_group": grp,
+                "mean_loss_final": round(mf, 6),
+                "mean_loss_raw": round(mr, 6),
+                "p90_loss_final": round(p90, 6),
+                "count": cnt,
+            }
+            for sid, grp, mf, mr, p90, cnt in self.get_worst_videos(top_n=20, is_reg=is_reg)
+        ]
+
+    def _summary_snapshot(self, is_reg: Optional[bool]) -> list:
+        """Format summary rows for JSON snapshot.
+
+        Args:
+            is_reg: False = concept, True = reg, None = combined (all).
+        """
+        rows = []
+        for (g_key, reg), g_ema in sorted(self._group_emas_by_reg.items()):
+            if is_reg is not None and reg != is_reg:
+                continue
+            orig_name = self._sanitized_reverse.get(g_key, g_key)
+            sample_count = self._group_sample_counts_by_reg.get((g_key, reg), 0)
+            rows.append({
+                "type": "group",
+                "name": orig_name,
+                "ema_200": round(g_ema.value, 6),
+                "sample_count": sample_count,
+            })
+        for (b_key, reg), b_ema in sorted(self._bucket_emas_by_reg.items()):
+            if is_reg is not None and reg != is_reg:
+                continue
+            rows.append({
+                "type": "noise",
+                "name": b_key,
+                "ema_200": round(b_ema.value, 6),
+                "sample_count": self._bucket_sample_counts_by_reg.get((b_key, reg), 0),
+            })
+        for (bidx, reg), b_ema in sorted(self._boundary_emas_by_reg.items()):
+            if is_reg is not None and reg != is_reg:
+                continue
+            rows.append({
+                "type": "boundary",
+                "name": str(bidx),
+                "ema_200": round(b_ema.value, 6),
+                "sample_count": self._boundary_sample_counts_by_reg.get((bidx, reg), 0),
+            })
+        return rows
+
+    def _matrix_snapshot(self, is_reg: Optional[bool]) -> list:
+        """Format matrix rows for JSON snapshot."""
+        rows = []
+        for (g_key, b_key, reg), ema in sorted(self._matrix_emas_by_reg.items()):
+            if is_reg is not None and reg != is_reg:
+                continue
+            orig_name = self._sanitized_reverse.get(g_key, g_key)
+            rows.append({
+                "group": orig_name,
+                "noise_bucket": b_key,
+                "mean_loss_final": round(ema.value, 6),
+            })
+        return rows
+
+    def _ema_snapshot(self, is_reg: bool) -> dict:
+        """Format EMA values for JSON snapshot."""
+        return {
+            "ema_50": round(self._reg_ema_50[is_reg].value, 6),
+            "ema_200": round(self._reg_ema_200[is_reg].value, 6),
+            "ema_1000": round(self._reg_ema_1000[is_reg].value, 6),
+        }
+
     def _write_snapshot(self, step: int) -> None:
         """Write a JSON snapshot of current tables for the web UI."""
+        samples_total = self._samples_total_by_reg[False] + self._samples_total_by_reg[True]
+
         snapshot: Dict[str, Any] = {
             "step": step,
             "wall_time": time.time(),
             "run_id": self.run_id,
-            "worst_videos": [
-                {
-                    "source_id": sid,
-                    "dataset_group": grp,
-                    "mean_loss_final": round(mf, 6),
-                    "mean_loss_raw": round(mr, 6),
-                    "p90_loss_final": round(p90, 6),
-                    "count": cnt,
-                }
-                for sid, grp, mf, mr, p90, cnt in self.get_worst_videos(top_n=20)
-            ],
-            "matrix": [
-                {
-                    "group": g_key,
-                    "noise_bucket": b_key,
-                    "mean_loss_final": round(ema.value, 6),
-                }
-                for (g_key, b_key), ema in sorted(self._matrix_emas.items())
-            ],
-            "summary": [],
+
+            # Combined (backwards compat)
+            "worst_videos": self._worst_videos_snapshot(is_reg=None),
+            "summary": self._summary_snapshot(is_reg=None),
+            "matrix": self._matrix_snapshot(is_reg=None),
             "ema": {
                 "ema_50": round(self._ema_50.value, 6),
                 "ema_200": round(self._ema_200.value, 6),
                 "ema_1000": round(self._ema_1000.value, 6),
             },
-        }
 
-        # Build summary rows (same logic as log_summary_table)
-        for g_key, g_ema in sorted(self._group_emas.items()):
-            snapshot["summary"].append({
-                "type": "group",
-                "name": g_key,
-                "ema_200": round(g_ema.value, 6),
-                "sample_count": self._group_sample_counts.get(g_key, 0),
-            })
-        for b_key, b_ema in sorted(self._bucket_emas.items()):
-            snapshot["summary"].append({
-                "type": "noise",
-                "name": b_key,
-                "ema_200": round(b_ema.value, 6),
-                "sample_count": self._bucket_sample_counts.get(b_key, 0),
-            })
-        for bidx, b_ema in sorted(self._boundary_emas.items()):
-            snapshot["summary"].append({
-                "type": "boundary",
-                "name": str(bidx),
-                "ema_200": round(b_ema.value, 6),
-                "sample_count": self._boundary_sample_counts.get(bidx, 0),
-            })
+            # Split fields (always present, empty array/0.0 if no data)
+            "worst_videos_concept": self._worst_videos_snapshot(is_reg=False),
+            "worst_videos_reg": self._worst_videos_snapshot(is_reg=True),
+            "summary_concept": self._summary_snapshot(is_reg=False),
+            "summary_reg": self._summary_snapshot(is_reg=True),
+            "matrix_concept": self._matrix_snapshot(is_reg=False),
+            "matrix_reg": self._matrix_snapshot(is_reg=True),
+            "ema_concept": self._ema_snapshot(is_reg=False),
+            "ema_reg": self._ema_snapshot(is_reg=True),
+            "has_reg_data": self._has_reg_data,
+
+            # Sample totals
+            "samples_total": samples_total,
+            "samples_concept_total": self._samples_total_by_reg[False],
+            "samples_reg_total": self._samples_total_by_reg[True],
+        }
 
         # Atomic write: write to tmp, then rename
         snapshot_path = os.path.join(

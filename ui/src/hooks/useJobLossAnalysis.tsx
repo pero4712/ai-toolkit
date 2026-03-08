@@ -31,10 +31,24 @@ export interface LossAnalysisData {
   step?: number;
   wall_time?: number;
   run_id?: string;
+  // Combined (backwards compat)
   worst_videos?: WorstVideo[];
   matrix?: MatrixCell[];
   summary?: SummaryRow[];
   ema?: { ema_50: number; ema_200: number; ema_1000: number };
+  // Reg/concept split
+  worst_videos_concept?: WorstVideo[];
+  worst_videos_reg?: WorstVideo[];
+  summary_concept?: SummaryRow[];
+  summary_reg?: SummaryRow[];
+  matrix_concept?: MatrixCell[];
+  matrix_reg?: MatrixCell[];
+  ema_concept?: { ema_50: number; ema_200: number; ema_1000: number };
+  ema_reg?: { ema_50: number; ema_200: number; ema_1000: number };
+  has_reg_data?: boolean;
+  samples_total?: number;
+  samples_concept_total?: number;
+  samples_reg_total?: number;
 }
 
 export default function useJobLossAnalysis(

@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { Job } from '@prisma/client';
 import useJobLossAnalysis, { MatrixCell } from '@/hooks/useJobLossAnalysis';
 import UniversalTable from './UniversalTable';
@@ -46,20 +46,45 @@ function pivotMatrix(cells: MatrixCell[]) {
 
 export default function JobLossAnalysis({ job }: { job: Job }) {
   const { data, status, refresh } = useJobLossAnalysis(job.id, 10000);
+  const [viewReg, setViewReg] = useState(false);
+
+  // Effective view: force concept when no reg data exists
+  const showReg = viewReg && !!data.has_reg_data;
+
+  // Pick data based on selected view, falling back to combined fields
+  const activeSummary = useMemo(() => {
+    if (showReg) return data.summary_reg ?? data.summary ?? [];
+    return data.summary_concept ?? data.summary ?? [];
+  }, [data, showReg]);
+
+  const activeMatrix = useMemo(() => {
+    if (showReg) return data.matrix_reg ?? data.matrix ?? [];
+    return data.matrix_concept ?? data.matrix ?? [];
+  }, [data, showReg]);
+
+  const activeWorstVideos = useMemo(() => {
+    if (showReg) return data.worst_videos_reg ?? data.worst_videos ?? [];
+    return data.worst_videos_concept ?? data.worst_videos ?? [];
+  }, [data, showReg]);
+
+  const activeEma = useMemo(() => {
+    if (showReg) return data.ema_reg ?? data.ema;
+    return data.ema_concept ?? data.ema;
+  }, [data, showReg]);
 
   const groupSummary = useMemo(
-    () => (data.summary ?? []).filter(r => r.type === 'group'),
-    [data.summary],
+    () => activeSummary.filter(r => r.type === 'group'),
+    [activeSummary],
   );
   const noiseSummary = useMemo(
-    () => (data.summary ?? []).filter(r => r.type === 'noise' || r.type === 'boundary'),
-    [data.summary],
+    () => activeSummary.filter(r => r.type === 'noise' || r.type === 'boundary'),
+    [activeSummary],
   );
 
-  const matrix = useMemo(() => pivotMatrix(data.matrix ?? []), [data.matrix]);
+  const matrix = useMemo(() => pivotMatrix(activeMatrix), [activeMatrix]);
 
   // Heatmap range
-  const allValues = useMemo(() => (data.matrix ?? []).map(c => c.mean_loss_final), [data.matrix]);
+  const allValues = useMemo(() => activeMatrix.map(c => c.mean_loss_final), [activeMatrix]);
   const minVal = allValues.length ? Math.min(...allValues) : 0;
   const maxVal = allValues.length ? Math.max(...allValues) : 1;
   const range = maxVal - minVal || 1;
@@ -100,17 +125,51 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
             &middot; Updated {timeAgo(data.wall_time)}
           </span>
         )}
+
+        {/* Concept / Reg toggle — only when reg data exists */}
+        {data.has_reg_data && (
+          <div className="flex gap-1 ml-2">
+            <button
+              onClick={() => setViewReg(false)}
+              className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                !viewReg
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+              }`}
+            >
+              Concept
+            </button>
+            <button
+              onClick={() => setViewReg(true)}
+              className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                viewReg
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+              }`}
+            >
+              Reg
+            </button>
+          </div>
+        )}
+
+        {/* Sample counts */}
+        {data.has_reg_data && data.samples_concept_total != null && data.samples_reg_total != null && (
+          <span className="text-xs text-gray-500">
+            {data.samples_concept_total.toLocaleString()} concept / {data.samples_reg_total.toLocaleString()} reg samples
+          </span>
+        )}
+
         <div className="flex-1" />
-        {data.ema && (
+        {activeEma && (
           <div className="flex gap-3 text-xs">
             <span className="bg-gray-800 px-2 py-0.5 rounded text-blue-400">
-              EMA-50: {formatNum(data.ema.ema_50)}
+              EMA-50: {formatNum(activeEma.ema_50)}
             </span>
             <span className="bg-gray-800 px-2 py-0.5 rounded text-emerald-400">
-              EMA-200: {formatNum(data.ema.ema_200)}
+              EMA-200: {formatNum(activeEma.ema_200)}
             </span>
             <span className="bg-gray-800 px-2 py-0.5 rounded text-purple-400">
-              EMA-1000: {formatNum(data.ema.ema_1000)}
+              EMA-1000: {formatNum(activeEma.ema_1000)}
             </span>
           </div>
         )}
@@ -224,10 +283,10 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
       )}
 
       {/* Worst Videos */}
-      {(data.worst_videos ?? []).length > 0 && (
+      {activeWorstVideos.length > 0 && (
         <div>
           <h3 className="text-sm font-medium text-gray-300 mb-2">
-            Worst Videos{' '}
+            Worst {showReg ? 'Reg' : 'Concept'} Videos{' '}
             <span className="text-gray-500 font-normal">(top 20 by mean loss)</span>
           </h3>
           <UniversalTable
@@ -261,7 +320,7 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
                 className: 'text-right',
               },
             ]}
-            rows={data.worst_videos ?? []}
+            rows={activeWorstVideos}
           />
         </div>
       )}
