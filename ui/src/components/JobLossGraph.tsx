@@ -63,7 +63,7 @@ function strokeForKey(key: string) {
 // Key categorization
 // ---------------------------------------------------------------------------
 
-type Section = 'overall' | 'noise' | 'boundary' | 'group' | 'other' | 'skip';
+type Section = 'overall' | 'noise' | 'boundary' | 'group' | 'other' | 'timing' | 'skip';
 
 function categorizeKey(key: string): Section {
   if (key === 'loss') return 'overall';
@@ -75,7 +75,8 @@ function categorizeKey(key: string): Section {
   if (key.startsWith('loss_by_group_ema/')) return 'group';
   if (key.startsWith('loss_by_group_reg_ema/')) return 'skip';
   if (key.includes('samples')) return 'skip';
-  if (key === 'step_time_ms') return 'skip';
+  if (key === 'step_time_ms') return 'timing';
+  if (key.includes('time') && key.includes('ms')) return 'timing';
   return 'other';
 }
 
@@ -114,9 +115,10 @@ interface LossSubChartProps {
   useLogScale: boolean;
   clipOutliers: boolean;
   height?: number;
+  sharedYDomain?: [number | 'auto', number | 'auto'];
 }
 
-function LossSubChart({ title, subtitle, keys, perSeries, showRaw, showSmoothed, useLogScale, clipOutliers, height = 240 }: LossSubChartProps) {
+function LossSubChart({ title, subtitle, keys, perSeries, showRaw, showSmoothed, useLogScale, clipOutliers, height = 240, sharedYDomain }: LossSubChartProps) {
   const chartData = useMemo(() => {
     const map = new Map<number, any>();
     for (const key of keys) {
@@ -138,7 +140,7 @@ function LossSubChart({ title, subtitle, keys, perSeries, showRaw, showSmoothed,
     return arr;
   }, [keys, perSeries]);
 
-  const yDomain = useMemo((): [number | 'auto', number | 'auto'] => {
+  const localYDomain = useMemo((): [number | 'auto', number | 'auto'] => {
     if (!clipOutliers || chartData.length < 10) return ['auto', 'auto'];
     const vals: number[] = [];
     for (const row of chartData) {
@@ -155,6 +157,8 @@ function LossSubChart({ title, subtitle, keys, perSeries, showRaw, showSmoothed,
     if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo === hi) return ['auto', 'auto'];
     return [lo, hi];
   }, [clipOutliers, chartData, keys, showSmoothed]);
+
+  const yDomain = sharedYDomain ?? localYDomain;
 
   if (chartData.length < 2) return null;
 
@@ -185,7 +189,7 @@ function LossSubChart({ title, subtitle, keys, perSeries, showRaw, showSmoothed,
               width={72}
               tickFormatter={formatNum}
               domain={yDomain}
-              allowDataOverflow={clipOutliers}
+              allowDataOverflow={clipOutliers || sharedYDomain !== undefined}
             />
             <Tooltip
               cursor={{ stroke: 'rgba(59,130,246,0.25)', strokeWidth: 1 }}
@@ -284,6 +288,7 @@ export default function JobLossGraph({ job }: { job: Job }) {
     const boundary: string[] = [];
     const group: string[] = [];
     const other: string[] = [];
+    const timing: string[] = [];
     const allNonSkipped: string[] = [];
 
     for (const k of lossKeys) {
@@ -295,10 +300,11 @@ export default function JobLossGraph({ job }: { job: Job }) {
         case 'noise': noise.push(k); break;
         case 'boundary': boundary.push(k); break;
         case 'group': group.push(k); break;
+        case 'timing': timing.push(k); break;
         case 'other': other.push(k); break;
       }
     }
-    return { overall, noise, boundary, group, other, allNonSkipped };
+    return { overall, noise, boundary, group, other, timing, allNonSkipped };
   }, [lossKeys]);
 
   // Process all non-skipped series (shared across all sub-charts)
@@ -351,6 +357,35 @@ export default function JobLossGraph({ job }: { job: Job }) {
     }
     return keys;
   }, [sortedGroupKeys, groupFilter, showAllGroups]);
+
+  // Shared Y domain so all group charts use the same scale for easy comparison
+  const groupSharedYDomain = useMemo((): [number | 'auto', number | 'auto'] => {
+    if (visibleGroupKeys.length <= 1) return ['auto', 'auto'];
+
+    const vals: number[] = [];
+    for (const key of visibleGroupKeys) {
+      const s = perSeries[key];
+      if (!s) continue;
+      const points = showSmoothed ? s.smooth : s.raw;
+      for (const p of points) {
+        if (typeof p.value === 'number' && Number.isFinite(p.value)) vals.push(p.value);
+      }
+    }
+    if (vals.length < 10) return ['auto', 'auto'];
+
+    vals.sort((a, b) => a - b);
+    if (clipOutliers) {
+      const lo = vals[Math.floor(vals.length * 0.02)];
+      const hi = vals[Math.ceil(vals.length * 0.98) - 1];
+      if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo === hi) return ['auto', 'auto'];
+      return [lo, hi];
+    } else {
+      const lo = vals[0];
+      const hi = vals[vals.length - 1];
+      if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo === hi) return ['auto', 'auto'];
+      return [lo, hi];
+    }
+  }, [visibleGroupKeys, perSeries, clipOutliers, showSmoothed]);
 
   const totalGroupCount = sortedGroupKeys.length;
   const isGroupCapped = !groupFilter && !showAllGroups && totalGroupCount > GROUP_CAP;
@@ -480,6 +515,15 @@ export default function JobLossGraph({ job }: { job: Job }) {
               />
             )}
 
+            {/* Step time (separate chart to avoid scale mismatch with loss values) */}
+            {sections.timing.length > 0 && (
+              <LossSubChart
+                title="Step Time"
+                keys={sections.timing}
+                {...sharedProps}
+              />
+            )}
+
             {/* Per-group charts */}
             {sortedGroupKeys.length > 0 && (
               <div className="space-y-3">
@@ -502,6 +546,7 @@ export default function JobLossGraph({ job }: { job: Job }) {
                     key={k}
                     title={groupNameFromKey(k)}
                     keys={[k]}
+                    sharedYDomain={groupSharedYDomain}
                     {...sharedProps}
                   />
                 ))}
