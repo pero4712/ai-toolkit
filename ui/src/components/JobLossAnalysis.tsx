@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Job } from '@prisma/client';
 import useJobLossAnalysis, { MatrixCell, WorstVideo } from '@/hooks/useJobLossAnalysis';
 import UniversalTable from './UniversalTable';
@@ -183,6 +183,106 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
   const maxVal = allValues.length ? Math.max(...allValues) : 1;
   const range = maxVal - minVal || 1;
 
+  // Export
+  const [exportOpen, setExportOpen] = useState(false);
+  const exportRef = useRef<HTMLDivElement>(null);
+
+  const buildExportJson = useCallback(() => {
+    const view = showReg ? 'reg' : 'concept';
+    const obj: Record<string, any> = {
+      view,
+      step: data.step ?? null,
+      wall_time: data.wall_time ? new Date(data.wall_time * 1000).toISOString() : null,
+    };
+
+    if (activeEma) {
+      obj.ema = activeEma;
+    }
+
+    if (data.has_reg_data) {
+      obj.samples = {
+        concept: data.samples_concept_total ?? null,
+        reg: data.samples_reg_total ?? null,
+      };
+    }
+
+    if (groupSummary.length > 0) {
+      obj.group_summary = groupSummary.map(r => ({
+        name: r.name,
+        ema_200: r.ema_200,
+        std_loss: r.std_loss ?? null,
+        relative_difficulty: r.relative_difficulty ?? null,
+        clip_count: r.clip_count ?? null,
+        sample_count: r.sample_count,
+      }));
+    }
+
+    if (noiseSummary.length > 0) {
+      obj.noise_summary = noiseSummary.map(r => ({
+        type: r.type,
+        name: r.name,
+        ema_200: r.ema_200,
+        sample_count: r.sample_count,
+      }));
+    }
+
+    if (activeMatrix.length > 0) {
+      obj.group_noise_matrix = {};
+      for (const c of activeMatrix) {
+        if (!obj.group_noise_matrix[c.group]) obj.group_noise_matrix[c.group] = {};
+        obj.group_noise_matrix[c.group][c.noise_bucket] = c.mean_loss_final;
+      }
+    }
+
+    if (activeWorstVideos.length > 0) {
+      obj.worst_videos = activeWorstVideos.map(v => ({
+        source_id: v.source_id,
+        group: v.dataset_group,
+        mean_loss: v.mean_loss_final,
+        z_score: v.z_score ?? null,
+        loss_ratio: v.loss_ratio ?? null,
+        trend: v.trend ?? null,
+        count: v.count,
+        caption: v.caption ?? null,
+      }));
+    }
+
+    if (Object.keys(activeWorstByGroup).length > 0) {
+      obj.worst_by_group = {};
+      for (const [group, clips] of Object.entries(activeWorstByGroup)) {
+        obj.worst_by_group[group] = clips.map(v => ({
+          source_id: v.source_id,
+          mean_loss: v.mean_loss_final,
+          z_score: v.z_score ?? null,
+          loss_ratio: v.loss_ratio ?? null,
+          trend: v.trend ?? null,
+          count: v.count,
+          caption: v.caption ?? null,
+        }));
+      }
+    }
+
+    return JSON.stringify(obj, null, 2);
+  }, [showReg, data, activeEma, groupSummary, noiseSummary, activeMatrix, activeWorstVideos, activeWorstByGroup]);
+
+  const handleDownload = useCallback(() => {
+    const json = buildExportJson();
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `loss-analysis-step${data.step ?? 0}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setExportOpen(false);
+  }, [buildExportJson, data.step]);
+
+  const handleCopy = useCallback(async () => {
+    const json = buildExportJson();
+    await navigator.clipboard.writeText(json);
+    setExportOpen(false);
+  }, [buildExportJson]);
+
   if (!data.available) {
     return (
       <div className="flex flex-col items-center justify-center h-64 text-gray-400 space-y-2">
@@ -267,6 +367,32 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
             </span>
           </div>
         )}
+
+        {/* Export dropdown */}
+        <div className="relative" ref={exportRef}>
+          <button
+            onClick={() => setExportOpen(v => !v)}
+            className="px-2 py-0.5 rounded text-xs font-medium bg-gray-800 text-gray-400 hover:text-gray-200 transition-colors"
+          >
+            Export JSON
+          </button>
+          {exportOpen && (
+            <div className="absolute right-0 top-full mt-1 z-20 bg-gray-800 border border-gray-700 rounded shadow-lg overflow-hidden">
+              <button
+                onClick={handleDownload}
+                className="block w-full text-left px-4 py-2 text-xs text-gray-300 hover:bg-gray-700 transition-colors whitespace-nowrap"
+              >
+                Download file
+              </button>
+              <button
+                onClick={handleCopy}
+                className="block w-full text-left px-4 py-2 text-xs text-gray-300 hover:bg-gray-700 transition-colors whitespace-nowrap"
+              >
+                Copy to clipboard
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Training Summary */}
