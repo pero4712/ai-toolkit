@@ -91,6 +91,23 @@ class LossLoggingConfig:
 # Per-sample event
 # ---------------------------------------------------------------------------
 
+_RE_DUP = re.compile(r'_dup\d+$')
+_RE_WINDOW = re.compile(r'_window\d+$')
+
+
+def _normalize_source_id(source_id: str) -> str:
+    """Strip ``_dupN`` suffix so duplicated clips merge into one entry."""
+    return _RE_DUP.sub('', source_id)
+
+
+def _parent_source_id(source_id: str) -> Optional[str]:
+    """Return parent id if *source_id* has a ``_windowN`` suffix, else None."""
+    normed = _normalize_source_id(source_id)
+    if _RE_WINDOW.search(normed):
+        return _RE_WINDOW.sub('', normed)
+    return None
+
+
 @dataclasses.dataclass
 class LossEvent:
     step: int
@@ -500,11 +517,13 @@ class LossTracker:
     # Video stats
     # -----------------------------------------------------------------------
 
-    def _update_video_stats(self, event: LossEvent, step: int) -> None:
-        vid_key = (event.source_id, event.is_reg)
+    def _ensure_and_update(
+        self, source_id: str, event: LossEvent, step: int,
+    ) -> None:
+        """Create or update a VideoStats entry for *source_id*."""
+        vid_key = (source_id, event.is_reg)
         if vid_key not in self._video_stats:
             if len(self._video_stats) >= self.config.max_tracked_videos:
-                # Evict: lowest total_count, tiebreaker oldest last_seen_step
                 evict_key = min(
                     self._video_stats,
                     key=lambda k: (
@@ -515,12 +534,23 @@ class LossTracker:
                 del self._video_stats[evict_key]
             g_key = self._get_sanitized_group(event.dataset_group)
             self._video_stats[vid_key] = VideoStats(
-                event.source_id, event.dataset_group, g_key, event.is_reg, window=50
+                source_id, event.dataset_group, g_key, event.is_reg, window=50
             )
         vs = self._video_stats[vid_key]
         vs.add(event.loss_final, event.loss_raw, step)
         if vs.caption is None and event.caption:
             vs.caption = " ".join(event.caption.split())[:self.config.caption_max_len]
+
+    def _update_video_stats(self, event: LossEvent, step: int) -> None:
+        norm_id = _normalize_source_id(event.source_id)
+
+        # Per-clip entry (dups merge, windows stay separate)
+        self._ensure_and_update(norm_id, event, step)
+
+        # Parent aggregate for windowed clips
+        parent_id = _parent_source_id(event.source_id)
+        if parent_id is not None and parent_id != norm_id:
+            self._ensure_and_update(parent_id, event, step)
 
     def get_worst_videos(
         self, top_n: int = 20, is_reg: Optional[bool] = False,
