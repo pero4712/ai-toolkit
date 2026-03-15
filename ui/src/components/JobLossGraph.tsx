@@ -272,6 +272,7 @@ export default function JobLossGraph({ job }: { job: Job }) {
   const [plotStride, setPlotStride] = useState(1);
   const [windowSize, setWindowSize] = useState<number>(4000);
   const [clipOutliers, setClipOutliers] = useState(false);
+  const [sharedGroupScale, setSharedGroupScale] = useState(false);
 
   // Group filter & cap
   const [groupFilter, setGroupFilter] = useState('');
@@ -546,7 +547,7 @@ export default function JobLossGraph({ job }: { job: Job }) {
                     key={k}
                     title={groupNameFromKey(k)}
                     keys={[k]}
-                    sharedYDomain={groupSharedYDomain}
+                    sharedYDomain={sharedGroupScale ? groupSharedYDomain : undefined}
                     {...sharedProps}
                   />
                 ))}
@@ -577,6 +578,7 @@ export default function JobLossGraph({ job }: { job: Job }) {
               <ToggleButton checked={showRaw} onClick={() => setShowRaw(v => !v)} label="Raw" />
               <ToggleButton checked={useLogScale} onClick={() => setUseLogScale(v => !v)} label="Log Y" />
               <ToggleButton checked={clipOutliers} onClick={() => setClipOutliers(v => !v)} label="Clip outliers" />
+              <ToggleButton checked={sharedGroupScale} onClick={() => setSharedGroupScale(v => !v)} label="Shared scale" />
             </div>
           </div>
 
