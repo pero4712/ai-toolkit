@@ -2,7 +2,7 @@
 
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { Job } from '@prisma/client';
-import useJobLossAnalysis, { MatrixCell, WorstVideo } from '@/hooks/useJobLossAnalysis';
+import useJobLossAnalysis, { MatrixCell, SummaryRow, WorstVideo } from '@/hooks/useJobLossAnalysis';
 import UniversalTable from './UniversalTable';
 
 function formatNum(v: number) {
@@ -188,70 +188,53 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
   const exportRef = useRef<HTMLDivElement>(null);
 
   const buildExportJson = useCallback(() => {
-    const view = showReg ? 'reg' : 'concept';
-    const obj: Record<string, any> = {
-      view,
-      step: data.step ?? null,
-      wall_time: data.wall_time ? new Date(data.wall_time * 1000).toISOString() : null,
-    };
+    const buildSection = (
+      summary: SummaryRow[],
+      matrix: MatrixCell[],
+      worstVideos: WorstVideo[],
+      worstByGroup: Record<string, WorstVideo[]>,
+      ema: { ema_50: number; ema_200: number; ema_1000: number } | undefined,
+      samplesTotal: number | null,
+    ) => {
+      const section: Record<string, any> = {};
+      if (samplesTotal != null) section.samples_total = samplesTotal;
+      if (ema) section.ema = ema;
 
-    if (activeEma) {
-      obj.ema = activeEma;
-    }
+      const groups = summary.filter(r => r.type === 'group');
+      const noises = summary.filter(r => r.type === 'noise' || r.type === 'boundary');
 
-    if (data.has_reg_data) {
-      obj.samples = {
-        concept: data.samples_concept_total ?? null,
-        reg: data.samples_reg_total ?? null,
-      };
-    }
-
-    if (groupSummary.length > 0) {
-      obj.group_summary = groupSummary.map(r => ({
-        name: r.name,
-        ema_200: r.ema_200,
-        std_loss: r.std_loss ?? null,
-        relative_difficulty: r.relative_difficulty ?? null,
-        clip_count: r.clip_count ?? null,
-        sample_count: r.sample_count,
-      }));
-    }
-
-    if (noiseSummary.length > 0) {
-      obj.noise_summary = noiseSummary.map(r => ({
-        type: r.type,
-        name: r.name,
-        ema_200: r.ema_200,
-        sample_count: r.sample_count,
-      }));
-    }
-
-    if (activeMatrix.length > 0) {
-      obj.group_noise_matrix = {};
-      for (const c of activeMatrix) {
-        if (!obj.group_noise_matrix[c.group]) obj.group_noise_matrix[c.group] = {};
-        obj.group_noise_matrix[c.group][c.noise_bucket] = c.mean_loss_final;
+      if (groups.length > 0) {
+        section.group_summary = groups.map(r => ({
+          name: r.name,
+          ema_200: r.ema_200,
+          std_loss: r.std_loss ?? null,
+          relative_difficulty: r.relative_difficulty ?? null,
+          clip_count: r.clip_count ?? null,
+          sample_count: r.sample_count,
+        }));
       }
-    }
 
-    if (activeWorstVideos.length > 0) {
-      obj.worst_videos = activeWorstVideos.map(v => ({
-        source_id: v.source_id,
-        group: v.dataset_group,
-        mean_loss: v.mean_loss_final,
-        z_score: v.z_score ?? null,
-        loss_ratio: v.loss_ratio ?? null,
-        trend: v.trend ?? null,
-        count: v.count,
-        caption: v.caption ?? null,
-      }));
-    }
+      if (noises.length > 0) {
+        section.noise_summary = noises.map(r => ({
+          type: r.type,
+          name: r.name,
+          ema_200: r.ema_200,
+          sample_count: r.sample_count,
+        }));
+      }
 
-    if (Object.keys(activeWorstByGroup).length > 0) {
-      obj.worst_by_group = {};
-      for (const [group, clips] of Object.entries(activeWorstByGroup)) {
-        obj.worst_by_group[group] = clips.map(v => ({
+      if (matrix.length > 0) {
+        section.group_noise_matrix = {};
+        for (const c of matrix) {
+          if (!section.group_noise_matrix[c.group]) section.group_noise_matrix[c.group] = {};
+          section.group_noise_matrix[c.group][c.noise_bucket] = c.mean_loss_final;
+        }
+      }
+
+      if (worstVideos.length > 0) {
+        section.worst_videos = worstVideos.map(v => ({
           source_id: v.source_id,
+          group: v.dataset_group,
           mean_loss: v.mean_loss_final,
           z_score: v.z_score ?? null,
           loss_ratio: v.loss_ratio ?? null,
@@ -260,10 +243,70 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
           caption: v.caption ?? null,
         }));
       }
+
+      if (Object.keys(worstByGroup).length > 0) {
+        section.worst_by_group = {};
+        for (const [group, clips] of Object.entries(worstByGroup)) {
+          section.worst_by_group[group] = clips.map(v => ({
+            source_id: v.source_id,
+            mean_loss: v.mean_loss_final,
+            z_score: v.z_score ?? null,
+            loss_ratio: v.loss_ratio ?? null,
+            trend: v.trend ?? null,
+            count: v.count,
+            caption: v.caption ?? null,
+          }));
+        }
+      }
+
+      return section;
+    };
+
+    const obj: Record<string, any> = {
+      step: data.step ?? null,
+      wall_time: data.wall_time ? new Date(data.wall_time * 1000).toISOString() : null,
+    };
+
+    if (data.has_reg_data) {
+      obj.samples = {
+        concept: data.samples_concept_total ?? null,
+        reg: data.samples_reg_total ?? null,
+      };
+
+      obj.concept = buildSection(
+        data.summary_concept ?? data.summary ?? [],
+        data.matrix_concept ?? data.matrix ?? [],
+        data.worst_videos_concept ?? data.worst_videos ?? [],
+        data.worst_by_group_concept ?? {},
+        data.ema_concept ?? data.ema,
+        data.samples_concept_total ?? null,
+      );
+
+      obj.reg = buildSection(
+        data.summary_reg ?? [],
+        data.matrix_reg ?? [],
+        data.worst_videos_reg ?? [],
+        data.worst_by_group_reg ?? {},
+        data.ema_reg,
+        data.samples_reg_total ?? null,
+      );
+    } else {
+      // No reg data — emit a single concept section at the top level for compactness.
+      Object.assign(
+        obj,
+        buildSection(
+          data.summary_concept ?? data.summary ?? [],
+          data.matrix_concept ?? data.matrix ?? [],
+          data.worst_videos_concept ?? data.worst_videos ?? [],
+          data.worst_by_group_concept ?? {},
+          data.ema_concept ?? data.ema,
+          data.samples_total ?? null,
+        ),
+      );
     }
 
     return JSON.stringify(obj, null, 2);
-  }, [showReg, data, activeEma, groupSummary, noiseSummary, activeMatrix, activeWorstVideos, activeWorstByGroup]);
+  }, [data]);
 
   const handleDownload = useCallback(() => {
     const json = buildExportJson();

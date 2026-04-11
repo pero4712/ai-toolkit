@@ -539,7 +539,7 @@ class LossTracker:
         vs = self._video_stats[vid_key]
         vs.add(event.loss_final, event.loss_raw, step)
         if vs.caption is None and event.caption:
-            vs.caption = " ".join(event.caption.split())[:self.config.caption_max_len]
+            vs.caption = " ".join(event.caption.split())
 
     def _update_video_stats(self, event: LossEvent, step: int) -> None:
         norm_id = _normalize_source_id(event.source_id)
