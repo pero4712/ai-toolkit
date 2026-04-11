@@ -493,6 +493,35 @@ class LossTracker:
                     self._matrix_emas_by_reg[key] = EMAScalar(span=200)
                 self._matrix_emas_by_reg[key].update(e.loss_final)
 
+        # Re-emit every initialized split EMA so chart lines stay continuous when
+        # reg/concept events alternate across steps. EMA values persist between
+        # updates, so writing them on steps without new samples is meaningful.
+        for is_reg in (False, True):
+            if self._reg_ema_200[is_reg]._initialized:
+                reg_tag = "reg" if is_reg else "concept"
+                metrics[f"loss_by_reg_ema/{reg_tag}"] = self._reg_ema_200[is_reg].value
+        for (g_key, is_reg), ema in self._group_emas_by_reg.items():
+            if not ema._initialized:
+                continue
+            metric_key = (
+                f"loss_by_group_reg_ema/{g_key}" if is_reg else f"loss_by_group_ema/{g_key}"
+            )
+            metrics.setdefault(metric_key, ema.value)
+        for (bucket, is_reg), ema in self._bucket_emas_by_reg.items():
+            if not ema._initialized:
+                continue
+            metric_key = (
+                f"loss_by_noise_reg_ema/{bucket}" if is_reg else f"loss_by_noise_ema/{bucket}"
+            )
+            metrics.setdefault(metric_key, ema.value)
+        for (bidx, is_reg), ema in self._boundary_emas_by_reg.items():
+            if not ema._initialized:
+                continue
+            metric_key = (
+                f"loss_by_boundary_reg/{bidx}" if is_reg else f"loss_by_boundary/{bidx}"
+            )
+            metrics.setdefault(metric_key, ema.value)
+
         # Ratio metrics (only when both sides have data this step)
         concept_count = len(events_by_reg.get(False, []))
         reg_count = len(events_by_reg.get(True, []))
