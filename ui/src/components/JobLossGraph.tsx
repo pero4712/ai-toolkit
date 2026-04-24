@@ -2,7 +2,7 @@
 
 import { Job } from '@prisma/client';
 import useJobLossLog, { LossPoint } from '@/hooks/useJobLossLog';
-import { useMemo, useState, useCallback } from 'react';
+import { useMemo, useState, useCallback, useRef } from 'react';
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, Legend } from 'recharts';
 
 // ---------------------------------------------------------------------------
@@ -31,6 +31,48 @@ function emaSmoothPoints(points: { step: number; value: number }[], alpha: numbe
     const x = points[i].value;
     prev = a * x + (1 - a) * prev;
     out[i] = { step: points[i].step, value: prev };
+  }
+  return out;
+}
+
+function downsampleSeries(
+  points: { step: number; value: number }[],
+  targetN: number,
+): { step: number; value: number }[] {
+  if (points.length === 0) return [];
+  if (points.length <= targetN) return points.map(p => ({ step: p.step, value: p.value }));
+  const firstStep = points[0].step;
+  const lastStep = points[points.length - 1].step;
+  const range = lastStep - firstStep;
+  if (range === 0) return [{ step: firstStep, value: points[points.length - 1].value }];
+  const bucketWidth = range / targetN;
+
+  const buckets = Array.from({ length: targetN }, () => ({
+    sum: 0,
+    count: 0,
+    minStep: Infinity,
+    maxStep: -Infinity,
+  }));
+
+  for (const p of points) {
+    let idx = Math.floor((p.step - firstStep) / bucketWidth);
+    if (idx >= targetN) idx = targetN - 1;
+    if (idx < 0) idx = 0;
+    const b = buckets[idx];
+    b.sum += p.value;
+    b.count++;
+    if (p.step < b.minStep) b.minStep = p.step;
+    if (p.step > b.maxStep) b.maxStep = p.step;
+  }
+
+  const out: { step: number; value: number }[] = [];
+  for (const b of buckets) {
+    if (b.count > 0) {
+      out.push({
+        step: Math.round((b.minStep + b.maxStep) / 2),
+        value: b.sum / b.count,
+      });
+    }
   }
   return out;
 }
@@ -429,6 +471,71 @@ export default function JobLossGraph({ job }: { job: Job }) {
     return last;
   }, [perSeries]);
 
+  // Export
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportTarget, setExportTarget] = useState(300);
+  const exportRef = useRef<HTMLDivElement>(null);
+
+  const buildExportJson = useCallback(() => {
+    const target = Math.max(10, Math.min(2000, exportTarget | 0));
+    const curvesByCat: Record<string, Record<string, { steps: number[]; values: number[] }>> = {};
+
+    let firstStep = Infinity;
+    let lastStep = -Infinity;
+    let totalPoints = 0;
+
+    for (const k of sections.allNonSkipped) {
+      const cat = categorizeKey(k);
+      if (cat === 'skip' || cat === 'timing') continue;
+      const pts = (series[k] ?? [])
+        .filter(p => p.value !== null && Number.isFinite(p.value as number))
+        .map(p => ({ step: p.step, value: p.value as number }));
+      if (pts.length === 0) continue;
+
+      totalPoints += pts.length;
+      if (pts[0].step < firstStep) firstStep = pts[0].step;
+      if (pts[pts.length - 1].step > lastStep) lastStep = pts[pts.length - 1].step;
+
+      const ds = downsampleSeries(pts, target);
+      if (!curvesByCat[cat]) curvesByCat[cat] = {};
+      curvesByCat[cat][displayName(k)] = {
+        steps: ds.map(p => p.step),
+        values: ds.map(p => +p.value.toPrecision(6)),
+      };
+    }
+
+    const obj = {
+      generated_at: new Date().toISOString(),
+      step_range: firstStep === Infinity ? null : { first: firstStep, last: lastStep },
+      raw_points_total: totalPoints,
+      downsampled_per_curve: target,
+      note:
+        'Each curve is the mean of logged values bucketed into ~N evenly-spaced steps across the training range. ' +
+        'Curves prefixed with ema/ are EMA-smoothed by the trainer (concept/reg, group, noise bucket). ' +
+        'Use for evaluating checkpoint candidates by trajectory shape; combine with per-checkpoint samples for final decisions.',
+      curves: curvesByCat,
+    };
+    return JSON.stringify(obj, null, 2);
+  }, [series, sections.allNonSkipped, exportTarget]);
+
+  const handleDownload = useCallback(() => {
+    const json = buildExportJson();
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `loss-curves-step${latestLoss?.step ?? 0}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setExportOpen(false);
+  }, [buildExportJson, latestLoss]);
+
+  const handleCopy = useCallback(async () => {
+    const json = buildExportJson();
+    await navigator.clipboard.writeText(json);
+    setExportOpen(false);
+  }, [buildExportJson]);
+
   const sharedProps = { perSeries, showRaw, showSmoothed, useLogScale, clipOutliers };
 
   return (
@@ -448,13 +555,53 @@ export default function JobLossGraph({ job }: { job: Job }) {
             )}
           </span>
         </div>
-        <button
-          type="button"
-          onClick={refreshLoss}
-          className="px-3 py-1 rounded-md text-xs bg-gray-700/60 hover:bg-gray-700 text-gray-200 border border-gray-700"
-        >
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <div className="relative" ref={exportRef}>
+            <button
+              type="button"
+              onClick={() => setExportOpen(v => !v)}
+              disabled={!hasAnyData}
+              className="px-3 py-1 rounded-md text-xs bg-gray-700/60 hover:bg-gray-700 text-gray-200 border border-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Export JSON
+            </button>
+            {exportOpen && (
+              <div className="absolute right-0 top-full mt-1 z-20 bg-gray-800 border border-gray-700 rounded shadow-lg overflow-hidden min-w-[220px]">
+                <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between gap-2">
+                  <label className="text-xs text-gray-400">Points per curve</label>
+                  <input
+                    type="number"
+                    min={10}
+                    max={2000}
+                    step={20}
+                    value={exportTarget}
+                    onChange={e => setExportTarget(Number(e.target.value))}
+                    className="w-20 bg-gray-900 border border-gray-700 rounded px-1 py-0.5 text-xs text-gray-200"
+                  />
+                </div>
+                <button
+                  onClick={handleDownload}
+                  className="block w-full text-left px-4 py-2 text-xs text-gray-300 hover:bg-gray-700 transition-colors whitespace-nowrap"
+                >
+                  Download file
+                </button>
+                <button
+                  onClick={handleCopy}
+                  className="block w-full text-left px-4 py-2 text-xs text-gray-300 hover:bg-gray-700 transition-colors whitespace-nowrap"
+                >
+                  Copy to clipboard
+                </button>
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={refreshLoss}
+            className="px-3 py-1 rounded-md text-xs bg-gray-700/60 hover:bg-gray-700 text-gray-200 border border-gray-700"
+          >
+            Refresh
+          </button>
+        </div>
       </div>
 
       {/* Charts */}
