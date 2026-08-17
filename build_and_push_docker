@@ -15,7 +15,7 @@ fi
 GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
 # Determine the correct base image from content hash
-BASE_HASH=$(cat docker/Dockerfile.base requirements.txt | sha256sum | cut -c1-12)
+BASE_HASH=$(cat docker/Dockerfile.base requirements.txt requirements_base.txt | sha256sum | cut -c1-12)
 BASE_TAG="pero4712/aitoolkit-base:$BASE_HASH"
 if ! docker manifest inspect "$BASE_TAG" > /dev/null 2>&1; then
     echo "Base image $BASE_TAG not found. Building it now..."

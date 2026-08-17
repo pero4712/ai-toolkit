@@ -55,11 +55,11 @@ RUN ln -s /usr/bin/python3 /usr/bin/python
 # (versions must match manager/spec.py — the AI Toolkit Manager's linux spec)
 RUN pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130 --break-system-packages
 
-# Install Python dependencies
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt && \
+# Install Python dependencies (requirements.txt includes requirements_base.txt)
+COPY requirements.txt requirements_base.txt /tmp/
+RUN cd /tmp && pip install --no-cache-dir --break-system-packages -r requirements.txt && \
     pip install setuptools==69.5.1 --no-cache-dir --break-system-packages && \
-    rm /tmp/requirements.txt
+    rm /tmp/requirements.txt /tmp/requirements_base.txt
 
 # Accelerators, matching the manager's linux cu130 spec (manager/spec.py):
 # flash-attn 2.8.3 (prebuilt for torch 2.13 / cu130 / cp312), NATTEN 0.21.7,

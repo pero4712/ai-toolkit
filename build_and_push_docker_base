@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Compute a content hash from the base image inputs
-BASE_HASH=$(cat docker/Dockerfile.base requirements.txt | sha256sum | cut -c1-12)
+BASE_HASH=$(cat docker/Dockerfile.base requirements.txt requirements_base.txt | sha256sum | cut -c1-12)
 BASE_TAG="pero4712/aitoolkit-base:$BASE_HASH"
 
 echo "Base image tag: $BASE_TAG"
