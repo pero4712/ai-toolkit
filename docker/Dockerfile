@@ -10,11 +10,12 @@ RUN echo "Cache bust: ${CACHEBUST}" && \
     cd ai-toolkit && \
     git checkout ${GIT_COMMIT}
 
-# Build UI
+# Build UI. update_db runs first because it does `prisma generate`, which
+# creates the @prisma/client types the TS build needs.
 WORKDIR /app/ai-toolkit/ui
 RUN npm install && \
-    npm run build && \
-    npm run update_db
+    npm run update_db && \
+    npm run build
 
 # Expose port (assuming the application runs on port 3000)
 EXPOSE 8675

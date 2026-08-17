@@ -51,8 +51,32 @@ export interface CpuInfo {
 
 export interface GPUApiResponse {
   hasNvidiaSmi: boolean;
+  isMac: boolean;
   gpus: GpuInfo[];
   error?: string;
+}
+
+/**
+ * System monitor stream (SSE at /api/monitor)
+ */
+
+// Rolling history only logs load + memory; everything else (temps, fans,
+// power, clocks) is instantaneous-only via MonitorSample.
+export interface MonitorHistoryPoint {
+  t: number; // epoch ms
+  cpu: { load: number; memUsedMb: number };
+  // one entry per GPU, same order as MonitorSample.gpu.gpus (sorted by index)
+  gpus: { load: number; memUsedMb: number }[];
+}
+
+export interface MonitorSample {
+  t: number;
+  cpu: CpuInfo | null;
+  gpu: GPUApiResponse;
+}
+
+export interface MonitorInit extends MonitorSample {
+  history: MonitorHistoryPoint[];
 }
 
 /**
@@ -70,6 +94,7 @@ export interface NetworkConfig {
   network_kwargs: {
     ignore_if_contains: string[];
   };
+  transformer_only?: boolean;
 }
 
 export interface SaveConfig {
@@ -107,11 +132,24 @@ export interface DatasetConfig {
   control_path_1?: string | null;
   control_path_2?: string | null;
   control_path_3?: string | null;
+  auto_frame_count?: boolean;
 }
 
 export interface EMAConfig {
   use_ema: boolean;
   ema_decay: number;
+}
+
+export interface ValidationItem {
+  image_path: string;
+  prompt: string;
+}
+
+export interface ValidationConfig {
+  validation_items: ValidationItem[];
+  resolution: number;
+  validate_every_n_steps: number;
+  validation_sigmas?: number[];
 }
 
 export interface TrainConfig {
@@ -147,6 +185,10 @@ export interface TrainConfig {
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
   audio_loss_multiplier?: number;
+  max_loss?: number | null;
+  validation_config?: ValidationConfig;
+  do_guidance_loss?: boolean;
+  guidance_loss_target?: number;
 }
 
 export interface QuantizeKwargsConfig {
@@ -167,6 +209,13 @@ export interface ModelConfig {
   layer_offloading_transformer_percent?: number;
   layer_offloading_text_encoder_percent?: number;
   assistant_lora_path?: string;
+  unconditional_lora_path?: string;
+  compile?: boolean;
+  block_compile?: boolean;
+  compile_mode?: 'default' | 'max-autotune' | 'fastest';
+  compile_fullgraph?: boolean;
+  compile_dynamic?: boolean;
+  cache_size_limit?: number;
 }
 
 export interface SampleItem {
@@ -190,6 +239,7 @@ export interface SampleItem {
 export interface SampleConfig {
   sampler: string;
   sample_every: number;
+  sample_start_step: number;
   width: number;
   height: number;
   prompts?: string[];
@@ -248,6 +298,43 @@ export interface JobConfig {
   job: string;
   config: ConfigObject;
   meta: MetaConfig;
+}
+
+export interface CaptionProcessConfig {
+  type: string;
+  sqlite_db_path?: string;
+  device: string;
+  caption: {
+    model_name_or_path: string;
+    model_name_or_path2?: string;
+    dtype: string;
+    quantize: boolean;
+    qtype: string;
+    low_vram: boolean;
+    extensions: string[];
+    path_to_caption: string;
+    recaption: boolean;
+    compile?: boolean;
+    caption_prompt?: string;
+    max_res?: number;
+    max_new_tokens?: number;
+    fixed_caption?: string;
+    caption_extension?: string;
+    thinking?: boolean;
+    batch_size?: number;
+    layer_offloading?: boolean;
+    layer_offloading_percent?: number;
+  }
+}
+
+export interface CaptionConfigObject {
+  name: string;
+  process: CaptionProcessConfig[];
+}
+
+export interface CaptionJobConfig {
+  job: string;
+  config: CaptionConfigObject;
 }
 
 export interface ConfigDoc {

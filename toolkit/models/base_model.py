@@ -41,6 +41,7 @@ from torchvision.transforms import functional as TF
 from toolkit.accelerator import get_accelerator, unwrap_model
 from typing import TYPE_CHECKING
 from toolkit.print import print_acc
+from toolkit.basic import flush
 
 if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork
@@ -88,11 +89,6 @@ class BlankNetwork:
 
     def train(self):
         pass
-
-
-def flush():
-    torch.cuda.empty_cache()
-    gc.collect()
 
 
 UNET_IN_CHANNELS = 4  # Stable Diffusion の in_channels は 4 で固定。XLも同じ。
@@ -181,6 +177,9 @@ class BaseModel:
         
         # set true for models that encode control image into text embeddings
         self.encode_control_in_text_embeddings = False
+        # control files may be VIDEOS (cached like dataset items, exposed on
+        # the batch as control_video_latents_list); see minimax_h3 ref2va
+        self.supports_video_control_images = False
         # control images will come in as a list for encoding some things if true
         self.has_multiple_control_images = False
         # do not resize control images
@@ -194,6 +193,15 @@ class BaseModel:
         # when padding to make batch size work, which side padding to use, right or left
         # some llms need left side padding, others need right side
         self.te_padding_side = "right"
+        
+        # can be used on models to invalidate cache if things change.
+        self.latent_space_version = None
+        
+        # if a mask is passed, do the loss with the mask. May be set false for models that use a mask for other reasons.
+        self.do_masked_loss = True
+        
+        # if the model outputs an x0 prediction (clean latent)
+        self.x0_pred = False
 
     # properties for old arch for backwards compatibility
     @property
@@ -256,6 +264,10 @@ class BaseModel:
     @property
     def is_lumina2(self):
         return self.arch == 'lumina2'
+    
+    @property
+    def text_embedding_space_version(self):
+        return self.arch
 
     def get_bucket_divisibility(self):
         if self.vae is None:
@@ -265,11 +277,30 @@ class BaseModel:
         except:
             # if we have a custom vae, it might not have this
             divisibility = 8
-        
+
         # flux packs this again,
         if self.is_flux:
             divisibility = divisibility * 2
         return divisibility
+
+    def prepare_sample_prompt_context(self, gen_config):
+        """Optional hook called right before a sample prompt is encoded, with
+        the sample's GenerateImageConfig, for models whose control conditioning
+        in the text embeds depends on sample settings (e.g. a video reference's
+        length capped at the sample's frame count)."""
+        return None
+
+    def get_frame_count_snapper(self):
+        """Optional hook for video models whose VAE accepts frame counts on a
+        grid other than the default ``temporal_compression * n + 1``.
+
+        Return a MODULE-LEVEL function ``(num_frames: int) -> int`` that snaps
+        an arbitrary frame count DOWN to the nearest count the video VAE can
+        encode (it must be picklable by reference — file items travel into
+        dataloader workers, so no lambdas or bound methods). Returning None
+        keeps the default auto_frame_count behavior.
+        """
+        return None
 
     # these must be implemented in child classes
     def load_model(self):
@@ -428,7 +459,7 @@ class BaseModel:
                 if network is not None:
                     assert network.is_active
 
-                for i in tqdm(range(len(image_configs)), desc=f"Generating Images", leave=False):
+                for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=True, position=0):
                     gen_config = image_configs[i]
 
                     extra = {}
@@ -522,7 +553,11 @@ class BaseModel:
                         if has_control_images and self.encode_control_in_text_embeddings:
                             ctrl_img_list = []
                     
-                            if gen_config.ctrl_img is not None:
+                            if gen_config.ctrl_img is not None and os.path.splitext(str(gen_config.ctrl_img))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                # control VIDEO: pass the path through; models with
+                                # supports_video_control_images handle it in get_prompt_embeds
+                                ctrl_img_list.append(str(gen_config.ctrl_img))
+                            elif gen_config.ctrl_img is not None:
                                 ctrl_img = Image.open(gen_config.ctrl_img).convert("RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img = (
@@ -532,7 +567,11 @@ class BaseModel:
                                 )
                                 ctrl_img_list.append(ctrl_img)
                             
-                            if gen_config.ctrl_img_1 is not None:
+                            if gen_config.ctrl_img_1 is not None and os.path.splitext(str(gen_config.ctrl_img_1))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                # control VIDEO: pass the path through; models with
+                                # supports_video_control_images handle it in get_prompt_embeds
+                                ctrl_img_list.append(str(gen_config.ctrl_img_1))
+                            elif gen_config.ctrl_img_1 is not None:
                                 ctrl_img_1 = Image.open(gen_config.ctrl_img_1).convert("RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img_1 = (
@@ -541,7 +580,11 @@ class BaseModel:
                                     .to(self.device_torch, dtype=self.torch_dtype)
                                 )
                                 ctrl_img_list.append(ctrl_img_1)
-                            if gen_config.ctrl_img_2 is not None:
+                            if gen_config.ctrl_img_2 is not None and os.path.splitext(str(gen_config.ctrl_img_2))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                # control VIDEO: pass the path through; models with
+                                # supports_video_control_images handle it in get_prompt_embeds
+                                ctrl_img_list.append(str(gen_config.ctrl_img_2))
+                            elif gen_config.ctrl_img_2 is not None:
                                 ctrl_img_2 = Image.open(gen_config.ctrl_img_2).convert("RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img_2 = (
@@ -550,7 +593,11 @@ class BaseModel:
                                     .to(self.device_torch, dtype=self.torch_dtype)
                                 )
                                 ctrl_img_list.append(ctrl_img_2)
-                            if gen_config.ctrl_img_3 is not None:
+                            if gen_config.ctrl_img_3 is not None and os.path.splitext(str(gen_config.ctrl_img_3))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                # control VIDEO: pass the path through; models with
+                                # supports_video_control_images handle it in get_prompt_embeds
+                                ctrl_img_list.append(str(gen_config.ctrl_img_3))
+                            elif gen_config.ctrl_img_3 is not None:
                                 ctrl_img_3 = Image.open(gen_config.ctrl_img_3).convert("RGB")
                                 # convert to 0 to 1 tensor
                                 ctrl_img_3 = (
@@ -565,6 +612,7 @@ class BaseModel:
                             else:
                                 ctrl_img = ctrl_img_list[0] if len(ctrl_img_list) > 0 else None
                         # encode the prompt ourselves so we can do fun stuff with embeddings
+                        self.prepare_sample_prompt_context(gen_config)
                         if isinstance(self.adapter, CustomAdapter):
                             self.adapter.is_unconditional_run = False
                         conditional_embeds = self.encode_prompt(
@@ -660,7 +708,7 @@ class BaseModel:
                         extra,
                     )
 
-                    gen_config.save_image(img, i)
+                    gen_config.save_image_atomic(img, i)
                     gen_config.log_image(img, i)
                     self._after_sample_image(i, len(image_configs))
                     flush()
@@ -1588,11 +1636,21 @@ class BaseModel:
     def get_transformer_block_names(self) -> Optional[List[str]]:
         # override in child classes to get transformer block names for lora targeting
         return None
+
+    def get_quantization_exclude_modules(self) -> Optional[List[str]]:
+        # override in child classes to keep sensitive modules in full precision when
+        # quantizing. Returns fnmatch patterns matched against the transformer's module
+        # names (e.g. "model.x_embedder*").
+        return None
     
     def get_base_model_version(self) -> str:
         # override in child classes to get the base model version
-        return "unknown"
+        return self.arch if self.arch is not None else 'unknown'
 
     def get_model_to_train(self):
         # called to get model to attach LoRAs to. Can be overridden in child classes
         return self.unet
+    
+    def scale_loss(self, loss):
+        # called to get the loss scaler for the model. Can be overridden in child classes
+        return loss
