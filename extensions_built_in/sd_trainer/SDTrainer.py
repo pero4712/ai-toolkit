@@ -2254,9 +2254,55 @@ class SDTrainer(BaseSDTrainProcess):
                         )
                         batch.audio_pred_slot = None
                         multiplier = self.train_config.diff_output_preservation_multiplier if self.train_config.diff_output_preservation else self.train_config.blank_prompt_preservation_multiplier
-                        preservation_loss = torch.nn.functional.mse_loss(preservation_pred, prior_pred) * multiplier
+                        # per-sample mean keeps batch alignment with file_items for
+                        # the tracker; the mean over samples matches the old
+                        # scalar mse_loss exactly
+                        preservation_loss_elementwise = torch.nn.functional.mse_loss(
+                            preservation_pred, prior_pred, reduction="none"
+                        )
+                        preservation_loss_per_sample = preservation_loss_elementwise.mean(
+                            dim=list(range(1, preservation_loss_elementwise.dim()))
+                        )
+                        preservation_loss = preservation_loss_per_sample.mean() * multiplier
                         self.additional_logs['loss/normal'] = loss.item()
                         self.additional_logs['loss/preservation'] = preservation_loss.item()
+
+                        # record per-sample preservation loss (group/noise/boundary
+                        # attributable drift pressure)
+                        if hasattr(self, 'loss_tracker') and self.loss_tracker.enabled:
+                            with torch.no_grad():
+                                from toolkit.loss_tracker import LossEvent, _bucket_timestep
+                                pres_raw_list = preservation_loss_per_sample.detach().float().cpu().tolist()
+                                pres_boundary_idx = self._get_boundary_index()
+                                for i in range(len(pres_raw_list)):
+                                    file_item = batch.file_items[i] if i < len(batch.file_items) else batch.file_items[0]
+                                    ds_cfg = file_item.dataset_config
+                                    group_name = ds_cfg.dataset_name or os.path.basename(
+                                        ds_cfg.dataset_path or ds_cfg.folder_path or "unknown"
+                                    )
+                                    t_val = int(timesteps[i].item()) if i < len(timesteps) else int(timesteps[0].item())
+                                    self.loss_tracker.record_sample_loss(LossEvent(
+                                        step=self.step_num,
+                                        sample_idx=i,
+                                        loss_raw=pres_raw_list[i],
+                                        loss_final=pres_raw_list[i] * multiplier,
+                                        dataset_group=group_name,
+                                        source_id=file_item.source_id,
+                                        source_path=file_item.path if self.loss_tracker.config.debug else "",
+                                        is_reg=file_item.is_reg,
+                                        timestep=t_val,
+                                        timestep_bucket=_bucket_timestep(
+                                            t_val,
+                                            self.train_config.num_train_timesteps,
+                                            self.loss_tracker.config.noise_bucket_edges,
+                                        ),
+                                        boundary_index=pres_boundary_idx,
+                                        loss_multiplier=multiplier,
+                                        token_dropout_rate=ds_cfg.token_dropout_rate,
+                                        caption_dropout_rate=ds_cfg.caption_dropout_rate,
+                                        is_caption_dropped=False,
+                                        is_preservation=True,
+                                    ))
 
                         # preserve the audio stream of joint audio models too.
                         # Both passes ran on the same noisy audio, so this holds

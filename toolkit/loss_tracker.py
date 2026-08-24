@@ -126,6 +126,9 @@ class LossEvent:
     caption_dropout_rate: float
     is_caption_dropped: bool
     caption: Optional[str] = None
+    # DOP/blank preservation loss events: aggregated in a separate metric
+    # family so they never contaminate the normal-loss stats or video stats
+    is_preservation: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +311,20 @@ class LossTracker:
         # Per-(group, bucket, is_reg) matrix EMAs for cross-tabulation
         self._matrix_emas_by_reg: Dict[Tuple[str, str, bool], EMAScalar] = {}
 
+        # Preservation-loss aggregates (DOP / blank prompt preservation).
+        # Same key structure as the normal-loss families above, but kept fully
+        # separate so preservation pressure is measurable per group / noise
+        # bucket / expert boundary without touching the normal stats.
+        self._pres_ema_by_reg: Dict[bool, EMAScalar] = {False: EMAScalar(200), True: EMAScalar(200)}
+        self._pres_group_emas_by_reg: Dict[Tuple[str, bool], EMAScalar] = {}
+        self._pres_group_sample_counts_by_reg: Dict[Tuple[str, bool], int] = defaultdict(int)
+        self._pres_bucket_emas_by_reg: Dict[Tuple[str, bool], EMAScalar] = {}
+        self._pres_bucket_sample_counts_by_reg: Dict[Tuple[str, bool], int] = defaultdict(int)
+        self._pres_boundary_emas_by_reg: Dict[Tuple[int, bool], EMAScalar] = {}
+        self._pres_boundary_sample_counts_by_reg: Dict[Tuple[int, bool], int] = defaultdict(int)
+        self._pres_matrix_emas_by_reg: Dict[Tuple[str, str, bool], EMAScalar] = {}
+        self._has_preservation_data = False
+
         # Whether any reg data has been seen
         self._has_reg_data = False
 
@@ -392,8 +409,21 @@ class LossTracker:
             self._banner_printed = True
 
         # Snapshot and clear
-        events = self._current_step_events
+        all_events = self._current_step_events
         self._current_step_events = []
+
+        # Preservation events feed their own metric family; everything below
+        # that reads `events` (EMAs, video stats, loss_mean) is normal-loss only
+        events = [e for e in all_events if not e.is_preservation]
+        pres_events = [e for e in all_events if e.is_preservation]
+
+        if not events:
+            # preservation-only step (shouldn't happen in practice): still
+            # aggregate preservation and write nothing else
+            metrics = {}
+            if pres_events:
+                self._aggregate_preservation(pres_events, metrics)
+            return metrics
 
         # Aggregate loss
         mean_loss_raw = sum(e.loss_raw for e in events) / len(events)
@@ -532,15 +562,102 @@ class LossTracker:
             )
             metrics["samples_ratio/reg_to_concept"] = float(reg_count) / float(concept_count)
 
+        # Preservation-loss aggregation (separate metric family)
+        if pres_events:
+            self._aggregate_preservation(pres_events, metrics)
+
         # Per-video tracking
         for e in events:
             self._update_video_stats(e, step)
 
-        # JSONL
+        # JSONL (both normal and preservation samples; the latter flagged)
         if self.config.write_jsonl:
-            self._write_jsonl(events, step, mean_loss_final, step_time_ms, optimizer_stepped)
+            self._write_jsonl(all_events, step, mean_loss_final, step_time_ms, optimizer_stepped)
 
         return metrics
+
+    def _aggregate_preservation(self, pres_events: List[LossEvent], metrics: Dict[str, float]) -> None:
+        """Update preservation EMAs and emit `preservation_*` metrics.
+
+        Mirrors the normal-loss family structure (reg split, per-group,
+        per-noise-bucket, per-boundary, group×bucket matrix) using
+        ``loss_final`` (i.e. after the preservation multiplier).
+        Initialized EMAs are re-emitted every call so chart lines stay
+        continuous, matching the normal-loss behavior.
+        """
+        self._has_preservation_data = True
+
+        by_reg: Dict[bool, List[LossEvent]] = defaultdict(list)
+        for e in pres_events:
+            by_reg[e.is_reg].append(e)
+
+        for is_reg, split_events in by_reg.items():
+            reg_suffix = "_reg" if is_reg else ""
+            reg_tag = "reg" if is_reg else "concept"
+            split_mean = sum(e.loss_final for e in split_events) / len(split_events)
+
+            self._pres_ema_by_reg[is_reg].update(split_mean)
+            metrics[f"preservation_ema/{reg_tag}"] = self._pres_ema_by_reg[is_reg].value
+
+            group_losses: Dict[str, List[float]] = defaultdict(list)
+            for e in split_events:
+                group_losses[e.dataset_group].append(e.loss_final)
+            for group, losses in group_losses.items():
+                g_key = self._get_sanitized_group(group)
+                key = (g_key, is_reg)
+                if key not in self._pres_group_emas_by_reg:
+                    self._pres_group_emas_by_reg[key] = EMAScalar(span=200)
+                self._pres_group_emas_by_reg[key].update(sum(losses) / len(losses))
+                self._pres_group_sample_counts_by_reg[key] += len(losses)
+                metrics[f"preservation_by_group{reg_suffix}_ema/{g_key}"] = self._pres_group_emas_by_reg[key].value
+
+            bucket_losses: Dict[str, List[float]] = defaultdict(list)
+            for e in split_events:
+                bucket_losses[e.timestep_bucket].append(e.loss_final)
+            for bucket, losses in bucket_losses.items():
+                key = (bucket, is_reg)
+                if key not in self._pres_bucket_emas_by_reg:
+                    self._pres_bucket_emas_by_reg[key] = EMAScalar(span=200)
+                self._pres_bucket_emas_by_reg[key].update(sum(losses) / len(losses))
+                self._pres_bucket_sample_counts_by_reg[key] += len(losses)
+                metrics[f"preservation_by_noise{reg_suffix}_ema/{bucket}"] = self._pres_bucket_emas_by_reg[key].value
+
+            boundary_losses: Dict[int, List[float]] = defaultdict(list)
+            for e in split_events:
+                if e.boundary_index is not None:
+                    boundary_losses[e.boundary_index].append(e.loss_final)
+            for bidx, losses in boundary_losses.items():
+                key = (bidx, is_reg)
+                if key not in self._pres_boundary_emas_by_reg:
+                    self._pres_boundary_emas_by_reg[key] = EMAScalar(span=200)
+                self._pres_boundary_emas_by_reg[key].update(sum(losses) / len(losses))
+                self._pres_boundary_sample_counts_by_reg[key] += len(losses)
+                metrics[f"preservation_by_boundary{reg_suffix}/{bidx}"] = self._pres_boundary_emas_by_reg[key].value
+
+            for e in split_events:
+                g_key = self._get_sanitized_group(e.dataset_group)
+                key = (g_key, e.timestep_bucket, is_reg)
+                if key not in self._pres_matrix_emas_by_reg:
+                    self._pres_matrix_emas_by_reg[key] = EMAScalar(span=200)
+                self._pres_matrix_emas_by_reg[key].update(e.loss_final)
+
+        # Re-emit initialized EMAs for line continuity across alternating steps
+        for is_reg in (False, True):
+            if self._pres_ema_by_reg[is_reg]._initialized:
+                reg_tag = "reg" if is_reg else "concept"
+                metrics.setdefault(f"preservation_ema/{reg_tag}", self._pres_ema_by_reg[is_reg].value)
+        for (g_key, is_reg), ema in self._pres_group_emas_by_reg.items():
+            if ema._initialized:
+                reg_suffix = "_reg" if is_reg else ""
+                metrics.setdefault(f"preservation_by_group{reg_suffix}_ema/{g_key}", ema.value)
+        for (bucket, is_reg), ema in self._pres_bucket_emas_by_reg.items():
+            if ema._initialized:
+                reg_suffix = "_reg" if is_reg else ""
+                metrics.setdefault(f"preservation_by_noise{reg_suffix}_ema/{bucket}", ema.value)
+        for (bidx, is_reg), ema in self._pres_boundary_emas_by_reg.items():
+            if ema._initialized:
+                reg_suffix = "_reg" if is_reg else ""
+                metrics.setdefault(f"preservation_by_boundary{reg_suffix}/{bidx}", ema.value)
 
     # -----------------------------------------------------------------------
     # Video stats
@@ -904,6 +1021,16 @@ class LossTracker:
             for typ, name, val, cnt in reg_rows:
                 print(f"  {typ:<10} {name:<20} {val:>10.6f} {cnt:>8}")
 
+        if self._has_preservation_data:
+            for is_reg, label in ((False, "concept"), (True, "reg")):
+                rows = self._preservation_summary_snapshot(is_reg=is_reg)
+                if not rows:
+                    continue
+                print(f"\n[LossTracker] Preservation summary ({label}) at step {step}:")
+                print(f"  {'type':<10} {'name':<20} {'ema_200':>10} {'samples':>8}")
+                for row in rows:
+                    print(f"  {row['type']:<10} {row['name']:<20} {row['ema_200']:>10.6f} {row['sample_count']:>8}")
+
         print()
 
         # W&B table (concept only for default dashboard)
@@ -956,6 +1083,8 @@ class LossTracker:
                 "is_caption_dropped": e.is_caption_dropped,
                 "loss_multiplier": e.loss_multiplier,
             }
+            if e.is_preservation:
+                sample["is_preservation"] = True
             if e.caption is not None:
                 sample["caption"] = e.caption
             if e.source_path:
@@ -975,7 +1104,10 @@ class LossTracker:
             "ema_50": round(self._ema_50.value, 8),
             "ema_200": round(self._ema_200.value, 8),
             "ema_1000": round(self._ema_1000.value, 8),
-            "samples_n": len(events),
+            # samples_n counts normal-loss samples only, so it keeps its meaning
+            # for pre-preservation tooling; preservation samples are counted apart
+            "samples_n": sum(1 for e in events if not e.is_preservation),
+            "preservation_samples_n": sum(1 for e in events if e.is_preservation),
             "groups_n": len(groups),
             "samples": samples,
         }
@@ -1087,6 +1219,51 @@ class LossTracker:
             })
         return rows
 
+    def _preservation_summary_snapshot(self, is_reg: Optional[bool]) -> list:
+        """Preservation-loss summary rows (group / noise / boundary EMAs)."""
+        rows = []
+        for (g_key, reg), ema in sorted(self._pres_group_emas_by_reg.items()):
+            if is_reg is not None and reg != is_reg:
+                continue
+            rows.append({
+                "type": "group",
+                "name": self._sanitized_reverse.get(g_key, g_key),
+                "ema_200": round(ema.value, 6),
+                "sample_count": self._pres_group_sample_counts_by_reg.get((g_key, reg), 0),
+            })
+        for (b_key, reg), ema in sorted(self._pres_bucket_emas_by_reg.items()):
+            if is_reg is not None and reg != is_reg:
+                continue
+            rows.append({
+                "type": "noise",
+                "name": b_key,
+                "ema_200": round(ema.value, 6),
+                "sample_count": self._pres_bucket_sample_counts_by_reg.get((b_key, reg), 0),
+            })
+        for (bidx, reg), ema in sorted(self._pres_boundary_emas_by_reg.items()):
+            if is_reg is not None and reg != is_reg:
+                continue
+            rows.append({
+                "type": "boundary",
+                "name": str(bidx),
+                "ema_200": round(ema.value, 6),
+                "sample_count": self._pres_boundary_sample_counts_by_reg.get((bidx, reg), 0),
+            })
+        return rows
+
+    def _preservation_matrix_snapshot(self, is_reg: Optional[bool]) -> list:
+        """Preservation group × noise bucket rows for JSON snapshot."""
+        rows = []
+        for (g_key, b_key, reg), ema in sorted(self._pres_matrix_emas_by_reg.items()):
+            if is_reg is not None and reg != is_reg:
+                continue
+            rows.append({
+                "group": self._sanitized_reverse.get(g_key, g_key),
+                "noise_bucket": b_key,
+                "mean_loss_final": round(ema.value, 6),
+            })
+        return rows
+
     def _ema_snapshot(self, is_reg: bool) -> dict:
         """Format EMA values for JSON snapshot."""
         return {
@@ -1148,6 +1325,13 @@ class LossTracker:
             # Per-group worst clips
             "worst_by_group_concept": self.get_worst_by_group(is_reg=False),
             "worst_by_group_reg": self.get_worst_by_group(is_reg=True) if self._has_reg_data else {},
+
+            # Preservation-loss (DOP) breakdowns
+            "has_preservation_data": self._has_preservation_data,
+            "preservation_summary_concept": self._preservation_summary_snapshot(is_reg=False),
+            "preservation_summary_reg": self._preservation_summary_snapshot(is_reg=True),
+            "preservation_matrix_concept": self._preservation_matrix_snapshot(is_reg=False),
+            "preservation_matrix_reg": self._preservation_matrix_snapshot(is_reg=True),
 
             # Group-level stats for external analysis
             "group_stats": self._group_stats_snapshot(),
