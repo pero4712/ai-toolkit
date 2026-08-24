@@ -2,7 +2,7 @@
 
 import { useState, use } from 'react';
 import { FaChevronLeft } from 'react-icons/fa';
-import { MdDashboard, MdImage, MdShowChart, MdCode, MdExtension } from 'react-icons/md';
+import { MdDashboard, MdImage, MdShowChart, MdCode, MdExtension, MdQueryStats } from 'react-icons/md';
 import { Button } from '@headlessui/react';
 import { TopBar, MainContent } from '@/components/layout';
 import useJob from '@/hooks/useJob';
@@ -58,6 +58,7 @@ const pages: Page[] = [
   {
     name: 'Loss Analysis',
     value: 'loss_analysis',
+    icon: MdQueryStats,
     component: JobLossAnalysis,
     mainCss: 'pt-24',
   },
