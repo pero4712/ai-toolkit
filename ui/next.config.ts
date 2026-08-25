@@ -10,7 +10,9 @@ const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_APP_VERSION: appVersion,
   },
-  serverExternalPackages: ['macstats', 'osx-temperature-sensor'],
+  // unzipper: its optional S3 integration references @aws-sdk/client-s3, which
+  // webpack would otherwise try (and fail) to bundle
+  serverExternalPackages: ['macstats', 'osx-temperature-sensor', 'unzipper'],
   async rewrites() {
     return [
       {

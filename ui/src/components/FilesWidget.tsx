@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import useFilesList from '@/hooks/useFilesList';
 import { Loader2, AlertCircle, Download, Box, Brain, Trash2, SlidersHorizontal } from 'lucide-react';
 import { openMergeLoRAsModal } from './MergeLoRAsModal';
@@ -8,6 +8,28 @@ import { apiClient } from '@/utils/api';
 
 export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName: string }) {
   const { files, status, refreshFiles } = useFilesList(jobID, 5000);
+  const [exporting, setExporting] = useState(false);
+
+  const handleExportState = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const res = await apiClient.post(`/api/jobs/${jobID}/export_state`, {});
+      const downloadPath = `/api/files/${encodeFilePathForUrl(res.data.zipPath)}?v=${Date.now()}`;
+      window.open(downloadPath, '_blank');
+    } catch (error: any) {
+      console.error('Error exporting job state:', error);
+      openConfirm({
+        title: 'Export failed',
+        message: error?.response?.data?.error ?? 'Could not build the state zip.',
+        type: 'warning',
+        confirmText: 'OK',
+        onConfirm: () => {},
+      });
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const isOptimizerFile = (filePath: string) => getFilename(filePath) === 'optimizer.pt';
   const checkpointFiles = files.filter(file => !isOptimizerFile(file.path));
@@ -53,24 +75,36 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
           <h2 className="font-semibold text-gray-100">Checkpoints</h2>
           <span className="px-2 py-0.5 bg-gray-700 rounded-full text-xs text-gray-300">{checkpointFiles.length}</span>
         </div>
-        {checkpointFiles.length > 0 && (
-          <span
-            className="px-3 py-1 rounded-full text-sm bg-purple-500/10 text-purple-500 uppercase cursor-pointer hover:bg-purple-500/20"
-            onClick={() => {
-              const outputName = `${jobName}_merged`;
-              openMergeLoRAsModal(
-                getFoldername(checkpointFiles[0].path),
-                outputName,
-                checkpointFiles.map(f => ({ path: f.path })),
-                () => {
-                  refreshFiles();
-                },
-              );
-            }}
-          >
-            merge
-          </span>
-        )}
+        <div className="flex items-center space-x-2">
+          {checkpointFiles.length > 0 && (
+            <span
+              className="px-3 py-1 rounded-full text-sm bg-amber-500/10 text-amber-500 uppercase cursor-pointer hover:bg-amber-500/20 flex items-center gap-1"
+              title="Download a zip with the latest checkpoint, optimizer state, config, and loss history — importable on another machine to resume training"
+              onClick={handleExportState}
+            >
+              {exporting && <Loader2 className="w-3 h-3 animate-spin" />}
+              {exporting ? 'zipping…' : 'export state'}
+            </span>
+          )}
+          {checkpointFiles.length > 0 && (
+            <span
+              className="px-3 py-1 rounded-full text-sm bg-purple-500/10 text-purple-500 uppercase cursor-pointer hover:bg-purple-500/20"
+              onClick={() => {
+                const outputName = `${jobName}_merged`;
+                openMergeLoRAsModal(
+                  getFoldername(checkpointFiles[0].path),
+                  outputName,
+                  checkpointFiles.map(f => ({ path: f.path })),
+                  () => {
+                    refreshFiles();
+                  },
+                );
+              }}
+            >
+              merge
+            </span>
+          )}
+        </div>
       </div>
 
       <div className="p-2">
