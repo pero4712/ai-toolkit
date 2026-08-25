@@ -202,12 +202,26 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
       activePresSummary
         .filter(r => r.type === 'group')
         .map(r => {
-          // both EMAs are post-multiplier (what actually reaches the gradient),
-          // so their ratio is the effective DOP share of the loss for the group
+          // Preservation loss is never scaled by the group's loss_multiplier,
+          // but the normal-loss EMA is — dividing by the post-multiplier value
+          // would overstate drift-per-unit-learning on damped groups (2x at
+          // x0.5). Prefer the raw EMA as denominator; fall back to un-scaling
+          // via the multiplier, then to the naive ratio for older snapshots.
           const normal = activeSummary.find(g => g.type === 'group' && g.name === r.name);
-          const dop_share =
-            normal && normal.ema_200 > 0 ? r.ema_200 / normal.ema_200 : null;
-          return { ...r, dop_share };
+          let denom: number | null = null;
+          let denomIsRaw = true;
+          if (normal) {
+            if (normal.ema_200_raw != null) {
+              denom = normal.ema_200_raw;
+            } else if (normal.loss_multiplier != null && normal.loss_multiplier > 0) {
+              denom = normal.ema_200 / normal.loss_multiplier;
+            } else {
+              denom = normal.ema_200;
+              denomIsRaw = false;
+            }
+          }
+          const dop_share = denom != null && denom > 0 ? r.ema_200 / denom : null;
+          return { ...r, dop_share, dop_share_is_raw: denomIsRaw };
         }),
     [activePresSummary, activeSummary],
   );
@@ -718,7 +732,20 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
                       title: 'DOP Share',
                       key: 'dop_share',
                       render: (row: any) =>
-                        row.dop_share != null ? `${(row.dop_share * 100).toPrecision(3)}%` : '',
+                        row.dop_share != null ? (
+                          <span
+                            title={
+                              row.dop_share_is_raw
+                                ? 'preservation EMA / pre-multiplier normal-loss EMA (drift per unit of learning)'
+                                : 'naive ratio vs post-multiplier loss: on multiplier-damped groups, true drift-per-unit-learning is share x multiplier (older snapshot without raw EMA)'
+                            }
+                          >
+                            {(row.dop_share * 100).toPrecision(3)}%
+                            {!row.dop_share_is_raw && <span className="text-amber-500">*</span>}
+                          </span>
+                        ) : (
+                          ''
+                        ),
                       className: 'text-right font-mono',
                     },
                     {
@@ -817,7 +844,7 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
         <div>
           <h3 className="text-sm font-medium text-gray-300 mb-2">
             Worst {showReg ? 'Reg' : 'Concept'} Videos{' '}
-            <span className="text-gray-500 font-normal">(top 20 by mean loss)</span>
+            <span className="text-gray-500 font-normal">(top 20 by raw loss, pre-multiplier)</span>
           </h3>
           <UniversalTable
             isLoading={status === 'loading'}

@@ -711,7 +711,11 @@ class LossTracker:
     def get_worst_videos(
         self, top_n: int = 20, is_reg: Optional[bool] = False,
     ) -> List[Tuple[str, str, float, float, float, int]]:
-        """Return worst videos by rolling mean loss_final.
+        """Return worst videos by rolling mean loss_raw.
+
+        Sorted on the pre-multiplier loss so groups with a loss_multiplier
+        (e.g. 0.5-damped datasets) compete on the same scale instead of being
+        silently pushed out of the list.
 
         Args:
             top_n: Maximum number of videos to return.
@@ -727,7 +731,7 @@ class LossTracker:
             if v.total_count >= self.config.worst_min_count
             and (is_reg is None or v.is_reg == is_reg)
         ]
-        eligible.sort(key=lambda v: v.mean, reverse=True)
+        eligible.sort(key=lambda v: v.mean_raw, reverse=True)
         result = []
         for v in eligible[:top_n]:
             result.append((
@@ -827,14 +831,15 @@ class LossTracker:
     ) -> List[Dict[str, Any]]:
         """Like get_worst_videos but returns dicts with z-score, trend, caption.
 
-        Requires _cache_group_stats() to have been called first.
+        Sorted by mean loss_raw (pre-multiplier) so multiplier-damped groups
+        are not scale-excluded. Requires _cache_group_stats() first.
         """
         eligible = [
             v for v in self._video_stats.values()
             if v.total_count >= self.config.worst_min_count
             and (is_reg is None or v.is_reg == is_reg)
         ]
-        eligible.sort(key=lambda v: v.mean, reverse=True)
+        eligible.sort(key=lambda v: v.mean_raw, reverse=True)
         return [self._compute_clip_diagnostics(v) for v in eligible[:top_n]]
 
     def get_worst_by_group(
