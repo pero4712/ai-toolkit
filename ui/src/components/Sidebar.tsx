@@ -118,6 +118,9 @@ const Sidebar = () => {
       </div>
       <div className="text-center text-[10px] text-gray-400 py-1 bg-gray-800">
         Ostris AI-Toolkit v{process.env.NEXT_PUBLIC_APP_VERSION}
+        {process.env.NEXT_PUBLIC_GIT_COMMIT && (
+          <span className="text-gray-500 font-mono"> ({process.env.NEXT_PUBLIC_GIT_COMMIT})</span>
+        )}
       </div>
     </>
   );
