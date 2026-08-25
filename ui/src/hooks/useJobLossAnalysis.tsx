@@ -35,6 +35,9 @@ export interface SummaryRow {
   max_loss?: number;
   clip_count?: number;
   relative_difficulty?: number;
+  // group rows only, tracker >= preservation extension
+  ema_200_raw?: number;
+  loss_multiplier?: number;
 }
 
 export interface LossAnalysisData {
@@ -64,6 +67,12 @@ export interface LossAnalysisData {
   // Per-group worst clips
   worst_by_group_concept?: Record<string, WorstVideo[]>;
   worst_by_group_reg?: Record<string, WorstVideo[]>;
+  // Preservation (DOP) breakdowns
+  has_preservation_data?: boolean;
+  preservation_summary_concept?: SummaryRow[];
+  preservation_summary_reg?: SummaryRow[];
+  preservation_matrix_concept?: MatrixCell[];
+  preservation_matrix_reg?: MatrixCell[];
   // Group-level stats
   group_stats?: Record<string, { mean: number; std: number; min: number; max: number; clip_count: number }>;
 }

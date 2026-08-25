@@ -299,6 +299,10 @@ class LossTracker:
         # Per-group EMAs split by is_reg: (sanitized_key, is_reg) → EMA
         self._group_emas_by_reg: Dict[Tuple[str, bool], EMAScalar] = {}
         self._group_sample_counts_by_reg: Dict[Tuple[str, bool], int] = defaultdict(int)
+        # pre-multiplier loss EMAs and the group's loss_multiplier, so the
+        # snapshot can show cross-group-comparable numbers
+        self._group_raw_emas_by_reg: Dict[Tuple[str, bool], EMAScalar] = {}
+        self._group_multiplier_by_reg: Dict[Tuple[str, bool], float] = {}
 
         # Per-noise-bucket split: (bucket, is_reg) → EMA
         self._bucket_emas_by_reg: Dict[Tuple[str, bool], EMAScalar] = {}
@@ -463,15 +467,21 @@ class LossTracker:
             metrics[f"samples_by_reg/{reg_tag}"] = float(len(split_events))
 
             # Per-group breakdown (concept = default keys, reg = _reg_ keys)
-            group_losses: Dict[str, List[float]] = defaultdict(list)
+            group_events: Dict[str, List[LossEvent]] = defaultdict(list)
             for e in split_events:
-                group_losses[e.dataset_group].append(e.loss_final)
-            for group, losses in group_losses.items():
+                group_events[e.dataset_group].append(e)
+            for group, evs in group_events.items():
+                losses = [e.loss_final for e in evs]
                 g_key = self._get_sanitized_group(group)
                 key = (g_key, is_reg)
                 if key not in self._group_emas_by_reg:
                     self._group_emas_by_reg[key] = EMAScalar(span=200)
+                    self._group_raw_emas_by_reg[key] = EMAScalar(span=200)
                 self._group_emas_by_reg[key].update(sum(losses) / len(losses))
+                self._group_raw_emas_by_reg[key].update(
+                    sum(e.loss_raw for e in evs) / len(evs)
+                )
+                self._group_multiplier_by_reg[key] = evs[-1].loss_multiplier
                 self._group_sample_counts_by_reg[key] += len(losses)
                 if is_reg:
                     metrics[f"loss_by_group_reg_ema/{g_key}"] = self._group_emas_by_reg[key].value
@@ -1176,6 +1186,12 @@ class LossTracker:
                 "ema_200": round(g_ema.value, 6),
                 "sample_count": sample_count,
             }
+            raw_ema = self._group_raw_emas_by_reg.get((g_key, reg))
+            if raw_ema is not None and raw_ema._initialized:
+                row["ema_200_raw"] = round(raw_ema.value, 6)
+            multiplier = self._group_multiplier_by_reg.get((g_key, reg))
+            if multiplier is not None:
+                row["loss_multiplier"] = multiplier
             # Enrich with cached group stats if available
             g_stats = getattr(self, "_cached_group_stats", {}).get((g_key, reg))
             if g_stats:

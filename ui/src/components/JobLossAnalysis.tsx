@@ -83,6 +83,15 @@ function worstVideoColumns(compact = false) {
       className: 'text-right font-mono',
     },
     {
+      // pre-multiplier loss: the comparable number across groups with
+      // different loss_multiplier settings
+      title: 'Raw',
+      key: 'mean_loss_raw',
+      render: (row: WorstVideo) =>
+        row.mean_loss_raw != null ? formatNum(row.mean_loss_raw) : '',
+      className: 'text-right font-mono text-gray-400',
+    },
+    {
       title: 'Z',
       key: 'z_score',
       render: (row: WorstVideo) => <ZScoreCell row={row} />,
@@ -177,6 +186,50 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
 
   const matrix = useMemo(() => pivotMatrix(activeMatrix), [activeMatrix]);
 
+  // Preservation (DOP) data — present when the tracker records preservation events
+  const activePresSummary = useMemo(() => {
+    if (showReg) return data.preservation_summary_reg ?? [];
+    return data.preservation_summary_concept ?? [];
+  }, [data, showReg]);
+
+  const activePresMatrix = useMemo(() => {
+    if (showReg) return data.preservation_matrix_reg ?? [];
+    return data.preservation_matrix_concept ?? [];
+  }, [data, showReg]);
+
+  const presGroupRows = useMemo(
+    () =>
+      activePresSummary
+        .filter(r => r.type === 'group')
+        .map(r => {
+          // both EMAs are post-multiplier (what actually reaches the gradient),
+          // so their ratio is the effective DOP share of the loss for the group
+          const normal = activeSummary.find(g => g.type === 'group' && g.name === r.name);
+          const dop_share =
+            normal && normal.ema_200 > 0 ? r.ema_200 / normal.ema_200 : null;
+          return { ...r, dop_share };
+        }),
+    [activePresSummary, activeSummary],
+  );
+
+  const presNoiseRows = useMemo(
+    () => activePresSummary.filter(r => r.type === 'noise' || r.type === 'boundary'),
+    [activePresSummary],
+  );
+
+  const presMatrix = useMemo(() => pivotMatrix(activePresMatrix), [activePresMatrix]);
+  const presValues = useMemo(() => activePresMatrix.map(c => c.mean_loss_final), [activePresMatrix]);
+  const presMin = presValues.length ? Math.min(...presValues) : 0;
+  const presMax = presValues.length ? Math.max(...presValues) : 1;
+  const presRange = presMax - presMin || 1;
+
+  // Empirical reg share of samples so far
+  const regShare = useMemo(() => {
+    const c = data.samples_concept_total ?? 0;
+    const r = data.samples_reg_total ?? 0;
+    return c + r > 0 ? r / (c + r) : null;
+  }, [data]);
+
   // Heatmap range
   const allValues = useMemo(() => activeMatrix.map(c => c.mean_loss_final), [activeMatrix]);
   const minVal = allValues.length ? Math.min(...allValues) : 0;
@@ -207,6 +260,8 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
         section.group_summary = groups.map(r => ({
           name: r.name,
           ema_200: r.ema_200,
+          ema_200_raw: r.ema_200_raw ?? null,
+          loss_multiplier: r.loss_multiplier ?? null,
           std_loss: r.std_loss ?? null,
           relative_difficulty: r.relative_difficulty ?? null,
           clip_count: r.clip_count ?? null,
@@ -236,6 +291,7 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
           source_id: v.source_id,
           group: v.dataset_group,
           mean_loss: v.mean_loss_final,
+          mean_loss_raw: v.mean_loss_raw ?? null,
           z_score: v.z_score ?? null,
           loss_ratio: v.loss_ratio ?? null,
           trend: v.trend ?? null,
@@ -260,6 +316,35 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
       }
 
       return section;
+    };
+
+    const buildPresSection = (summary: SummaryRow[], matrix: MatrixCell[]) => {
+      const section: Record<string, any> = {};
+      const groups = summary.filter(r => r.type === 'group');
+      const noises = summary.filter(r => r.type === 'noise' || r.type === 'boundary');
+      if (groups.length > 0) {
+        section.by_group = groups.map(r => ({
+          name: r.name,
+          ema_200: r.ema_200,
+          sample_count: r.sample_count,
+        }));
+      }
+      if (noises.length > 0) {
+        section.by_noise = noises.map(r => ({
+          type: r.type,
+          name: r.name,
+          ema_200: r.ema_200,
+          sample_count: r.sample_count,
+        }));
+      }
+      if (matrix.length > 0) {
+        section.group_noise_matrix = {};
+        for (const c of matrix) {
+          if (!section.group_noise_matrix[c.group]) section.group_noise_matrix[c.group] = {};
+          section.group_noise_matrix[c.group][c.noise_bucket] = c.mean_loss_final;
+        }
+      }
+      return Object.keys(section).length > 0 ? section : null;
     };
 
     const obj: Record<string, any> = {
@@ -290,6 +375,19 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
         data.ema_reg,
         data.samples_reg_total ?? null,
       );
+
+      if (data.has_preservation_data) {
+        const presConcept = buildPresSection(
+          data.preservation_summary_concept ?? [],
+          data.preservation_matrix_concept ?? [],
+        );
+        const presReg = buildPresSection(
+          data.preservation_summary_reg ?? [],
+          data.preservation_matrix_reg ?? [],
+        );
+        if (presConcept) obj.concept.preservation = presConcept;
+        if (presReg) obj.reg.preservation = presReg;
+      }
     } else {
       // No reg data — emit a single concept section at the top level for compactness.
       Object.assign(
@@ -303,6 +401,13 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
           data.samples_total ?? null,
         ),
       );
+      if (data.has_preservation_data) {
+        const pres = buildPresSection(
+          data.preservation_summary_concept ?? [],
+          data.preservation_matrix_concept ?? [],
+        );
+        if (pres) obj.preservation = pres;
+      }
     }
 
     return JSON.stringify(obj, null, 2);
@@ -393,6 +498,9 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
         {data.has_reg_data && data.samples_concept_total != null && data.samples_reg_total != null && (
           <span className="text-xs text-gray-500">
             {data.samples_concept_total.toLocaleString()} concept / {data.samples_reg_total.toLocaleString()} reg samples
+            {regShare != null && (
+              <span className="text-gray-400"> ({(regShare * 100).toFixed(1)}% reg)</span>
+            )}
           </span>
         )}
 
@@ -456,6 +564,22 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
                       key: 'ema_200',
                       render: (row: any) => formatNum(row.ema_200),
                       className: 'text-right font-mono',
+                    },
+                    {
+                      title: 'Raw',
+                      key: 'ema_200_raw',
+                      render: (row: any) =>
+                        row.ema_200_raw != null ? formatNum(row.ema_200_raw) : '',
+                      className: 'text-right font-mono text-gray-400',
+                    },
+                    {
+                      title: 'Mult',
+                      key: 'loss_multiplier',
+                      render: (row: any) =>
+                        row.loss_multiplier != null && row.loss_multiplier !== 1
+                          ? `×${row.loss_multiplier}`
+                          : '',
+                      className: 'text-right text-gray-500',
                     },
                     {
                       title: 'StdDev',
@@ -563,6 +687,128 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {/* Preservation (DOP) drift pressure */}
+      {data.has_preservation_data && (presGroupRows.length > 0 || presNoiseRows.length > 0) && (
+        <div>
+          <h3 className="text-sm font-medium text-gray-300 mb-2">
+            Preservation Loss (DOP){' '}
+            <span className="text-gray-500 font-normal">
+              (class-prompt drift pressure; values are post-multiplier)
+            </span>
+          </h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {presGroupRows.length > 0 && (
+              <div>
+                <p className="text-xs text-gray-500 mb-1">By Dataset Group</p>
+                <UniversalTable
+                  isLoading={status === 'loading'}
+                  onRefresh={refresh}
+                  columns={[
+                    { title: 'Group', key: 'name' },
+                    {
+                      title: 'Pres EMA-200',
+                      key: 'ema_200',
+                      render: (row: any) => formatNum(row.ema_200),
+                      className: 'text-right font-mono',
+                    },
+                    {
+                      title: 'DOP Share',
+                      key: 'dop_share',
+                      render: (row: any) =>
+                        row.dop_share != null ? `${(row.dop_share * 100).toPrecision(3)}%` : '',
+                      className: 'text-right font-mono',
+                    },
+                    {
+                      title: 'Samples',
+                      key: 'sample_count',
+                      render: (row: any) => row.sample_count.toLocaleString(),
+                      className: 'text-right',
+                    },
+                  ]}
+                  rows={presGroupRows}
+                />
+              </div>
+            )}
+            {presNoiseRows.length > 0 && (
+              <div>
+                <p className="text-xs text-gray-500 mb-1">By Noise Bucket / Expert</p>
+                <UniversalTable
+                  isLoading={status === 'loading'}
+                  onRefresh={refresh}
+                  columns={[
+                    {
+                      title: 'Bucket',
+                      key: 'name',
+                      render: (row: any) =>
+                        row.type === 'boundary' ? `expert ${row.name}` : row.name,
+                    },
+                    {
+                      title: 'Pres EMA-200',
+                      key: 'ema_200',
+                      render: (row: any) => formatNum(row.ema_200),
+                      className: 'text-right font-mono',
+                    },
+                    {
+                      title: 'Samples',
+                      key: 'sample_count',
+                      render: (row: any) => row.sample_count.toLocaleString(),
+                      className: 'text-right',
+                    },
+                  ]}
+                  rows={presNoiseRows}
+                />
+              </div>
+            )}
+          </div>
+
+          {presMatrix.groups.length > 0 && (
+            <div className="mt-3">
+              <p className="text-xs text-gray-500 mb-1">Preservation Group × Noise Matrix</p>
+              <div className="overflow-x-auto">
+                <table className="text-sm text-left text-gray-300">
+                  <thead className="text-xs uppercase bg-gray-800 text-gray-400">
+                    <tr>
+                      <th className="px-3 py-2">Group</th>
+                      {presMatrix.buckets.map(b => (
+                        <th key={b} className="px-3 py-2 text-right">
+                          {b}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {presMatrix.groups.map((g, gi) => (
+                      <tr
+                        key={g}
+                        className={`${gi % 2 === 0 ? 'bg-gray-900' : 'bg-gray-800'} border-b border-gray-700`}
+                      >
+                        <td className="px-3 py-2">{g}</td>
+                        {presMatrix.buckets.map(b => {
+                          const val = presMatrix.map[g]?.[b];
+                          const norm = val != null ? (val - presMin) / presRange : 0;
+                          const opacity = Math.round(10 + norm * 40);
+                          return (
+                            <td
+                              key={b}
+                              className="px-3 py-2 text-right font-mono"
+                              style={{
+                                backgroundColor: `rgba(59, 130, 246, ${opacity / 100})`,
+                              }}
+                            >
+                              {val != null ? formatNum(val) : '—'}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
