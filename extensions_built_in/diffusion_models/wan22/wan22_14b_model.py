@@ -1,5 +1,6 @@
 from functools import partial
 import os
+import time
 from typing import Any, Dict, Optional, Union, List
 from typing_extensions import Self
 import torch
@@ -85,6 +86,10 @@ class DualWanTransformer3DModel(torch.nn.Module):
         self.boundary: float = self.boundary_ratio * 1000
         self.low_vram: bool = low_vram
         self._active_transformer_name = "transformer_1"  # default to transformer_1
+        # expert-swap perf counters (totals since last read; see
+        # Wan2214bModel.get_performance_logs)
+        self.perf_swap_count: int = 0
+        self.perf_swap_seconds: float = 0.0
 
     @property
     def device(self) -> torch.device:
@@ -132,9 +137,13 @@ class DualWanTransformer3DModel(torch.nn.Module):
             # todo swap the loras as well
             if t_name != self._active_transformer_name:
                 if self.low_vram:
+                    swap_start = time.time()
                     getattr(self, self._active_transformer_name).to("cpu")
                     getattr(self, t_name).to(self.device_torch)
                     torch.cuda.empty_cache()
+                    # perf counters read + reset by Wan2214bModel.get_performance_logs
+                    self.perf_swap_count += 1
+                    self.perf_swap_seconds += time.time() - swap_start
                 self._active_transformer_name = t_name
 
         if self.transformer.device != hidden_states.device:
@@ -216,6 +225,21 @@ class Wan2214bModel(Wan21):
         # every downstream modulation; keep them in full precision when quantizing.
         # names are relative to each individual transformer (they quantize separately)
         return ["condition_embedder*", "proj_out*"]
+
+    def get_performance_logs(self) -> dict:
+        """Return accumulated perf counter totals since the last call and reset.
+
+        Read by BaseSDTrainProcess._log_timing_metrics, which divides by the
+        logging interval, so keys are named for their per-step meaning.
+        """
+        logs = {}
+        dual = getattr(self, 'model', None)
+        if dual is not None and getattr(dual, 'perf_swap_count', 0) > 0:
+            logs['efficiency/expert_swaps_per_step'] = float(dual.perf_swap_count)
+            logs['timing/expert_swap_ms'] = dual.perf_swap_seconds * 1000.0
+            dual.perf_swap_count = 0
+            dual.perf_swap_seconds = 0.0
+        return logs
 
     @property
     def max_step_saves_to_keep_multiplier(self):

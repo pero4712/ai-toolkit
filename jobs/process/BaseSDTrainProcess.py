@@ -128,6 +128,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.first_sample_config = self.sample_config
         self.logging_config = LoggingConfig(**self.get_conf('logging', {}))
         self.logger = create_logger(self.logging_config, config, self.save_root)
+        # timing metrics feed the UI's Efficiency tab; when a UI logger is
+        # attached, default the interval on instead of requiring the YAML key
+        if self.performance_log_every == 0 and self.logging_config.use_ui_logger:
+            self.performance_log_every = 10
         if self.logging_config.structured_loss:
             from toolkit.loss_tracker import LossTracker, LossLoggingConfig
             self.loss_tracker = LossTracker(
@@ -830,6 +834,74 @@ class BaseSDTrainProcess(BaseTrainProcess):
     
     def hook_after_sd_init_before_load(self):
         pass
+
+    def _log_timing_metrics(self):
+        """Log a curated timing breakdown from the step timer as metric keys.
+
+        Values are wall-clock averages over the timer window (since the last
+        reset, capped at 10 samples per label). They measure CPU-side time --
+        async GPU work lands at the next sync point -- which is the right
+        measure for stall detection: data waits, weight swaps, and encodes
+        are real wall-time. Runs every performance_log_every steps, just
+        before the timer buffers are printed and reset. Keys flow into
+        loss_log.db and surface in the UI's Efficiency tab and Loss Graph.
+        """
+        if not self.accelerator.is_main_process:
+            return
+        try:
+            label_map = {
+                'train_loop': 'timing/step_ms',
+                'encode_prompt': 'timing/te_encode_ms',
+                'prepare_latents': 'timing/vae_encode_ms',
+                'predict_unet': 'timing/forward_ms',
+                'prior predict': 'timing/prior_forward_ms',
+                'calculate_loss': 'timing/loss_ms',
+                'backward': 'timing/backward_ms',
+                'optimizer_step': 'timing/optimizer_ms',
+                'ema_update': 'timing/ema_ms',
+            }
+            avgs = {
+                name: sum(times) / len(times)
+                for name, times in self.timer.timers.items()
+                if len(times) > 0
+            }
+            logs = {}
+            for label, key in label_map.items():
+                if label in avgs:
+                    logs[key] = avgs[label] * 1000.0
+
+            # data wait: per-fetch average across the concept and reg loaders.
+            # This is the true worker-starvation signal (wraps next(dataloader)).
+            wait_times = list(self.timer.timers.get('get_batch', [])) + \
+                list(self.timer.timers.get('get_batch:reg', []))
+            if wait_times:
+                data_wait_s = sum(wait_times) / len(wait_times)
+                logs['timing/data_wait_ms'] = data_wait_s * 1000.0
+                if avgs.get('train_loop', 0) > 0:
+                    logs['efficiency/data_wait_pct'] = min(
+                        100.0, data_wait_s / avgs['train_loop'] * 100.0
+                    )
+
+            # VRAM high-water mark over the interval (host-side counter, no sync)
+            if torch.cuda.is_available():
+                logs['efficiency/vram_peak_gb'] = torch.cuda.max_memory_allocated() / 1e9
+                torch.cuda.reset_peak_memory_stats()
+
+            # model-specific counters (e.g. wan22 expert swaps): models return
+            # totals accumulated since the last call; convert to per-step
+            get_perf = getattr(self.sd, 'get_performance_logs', None)
+            if callable(get_perf):
+                perf = get_perf()
+                if perf:
+                    interval = max(1, self.performance_log_every)
+                    for key, value in perf.items():
+                        logs[key] = value / interval
+
+            if logs:
+                self.logger.log(logs)
+        except Exception as e:
+            # metrics must never take down training
+            print_acc(f"Error logging timing metrics: {e}")
 
     def get_latest_save_path(self, name=None, post='', include_pretrained_lora=True):
         if name == None:
@@ -2809,6 +2881,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
+                        # emit timing breakdown metrics before print() resets the buffers
+                        self._log_timing_metrics()
                         # print the timers and clear them
                         self.timer.print()
                         self.timer.reset()

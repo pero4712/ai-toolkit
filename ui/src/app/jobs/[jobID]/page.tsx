@@ -2,7 +2,7 @@
 
 import { useState, use } from 'react';
 import { FaChevronLeft } from 'react-icons/fa';
-import { MdDashboard, MdImage, MdShowChart, MdCode, MdExtension, MdQueryStats } from 'react-icons/md';
+import { MdDashboard, MdImage, MdShowChart, MdCode, MdExtension, MdQueryStats, MdSpeed } from 'react-icons/md';
 import { Button } from '@headlessui/react';
 import { TopBar, MainContent } from '@/components/layout';
 import useJob from '@/hooks/useJob';
@@ -14,11 +14,12 @@ import JobActionBar from '@/components/JobActionBar';
 import JobConfigViewer from '@/components/JobConfigViewer';
 import JobLossGraph from '@/components/JobLossGraph';
 import JobLossAnalysis from '@/components/JobLossAnalysis';
+import JobEfficiency from '@/components/JobEfficiency';
 import JobPlugin from '@/components/JobPlugin';
 import { Job } from '@prisma/client';
 import { apiClient } from '@/utils/api';
 
-type PageKey = 'overview' | 'samples' | 'config' | 'loss_log' | 'loss_analysis' | 'plugin';
+type PageKey = 'overview' | 'samples' | 'config' | 'loss_log' | 'loss_analysis' | 'efficiency' | 'plugin';
 
 interface Page {
   name: string;
@@ -61,6 +62,14 @@ const pages: Page[] = [
     icon: MdQueryStats,
     component: JobLossAnalysis,
     mainCss: 'pt-24',
+  },
+  {
+    name: 'Efficiency',
+    value: 'efficiency',
+    icon: MdSpeed,
+    component: JobEfficiency,
+    mainCss: 'pt-24',
+    jobTypes: ['train'],
   },
   {
     name: 'Config File',

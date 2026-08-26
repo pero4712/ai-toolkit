@@ -1,3 +1,5 @@
+import time
+
 import torch
 from toolkit.models.wan21.wan_utils import add_first_frame_conditioning
 from toolkit.prompt_utils import PromptEmbeds
@@ -14,8 +16,16 @@ from .wan22_14b_model import Wan2214bModel
 
 class Wan2214bI2VModel(Wan2214bModel):
     arch = "wan22_14b_i2v"
-    
-    
+
+    def get_performance_logs(self) -> dict:
+        logs = super().get_performance_logs()
+        cond_seconds = getattr(self, '_perf_i2v_cond_seconds', 0.0)
+        if cond_seconds > 0:
+            logs['timing/i2v_cond_encode_ms'] = cond_seconds * 1000.0
+            self._perf_i2v_cond_seconds = 0.0
+        return logs
+
+
     def generate_single_image(
         self,
         pipeline: Wan22Pipeline,
@@ -126,12 +136,18 @@ class Wan2214bI2VModel(Wan2214bModel):
                 first_frames = frames[:, 0]
             else:
                 raise ValueError(f"Unknown frame shape {frames.shape}")
-            
-            # Add conditioning using the standalone function
+
+            # Add conditioning using the standalone function. This runs a
+            # full-length VAE encode every step (known arch cost); timed so
+            # the Efficiency tab can show it.
+            cond_start = time.time()
             conditioned_latent = add_first_frame_conditioning(
                 latent_model_input=latent_model_input,
                 first_frame=first_frames,
                 vae=self.vae
+            )
+            self._perf_i2v_cond_seconds = (
+                getattr(self, '_perf_i2v_cond_seconds', 0.0) + time.time() - cond_start
             )
         
         noise_pred = self.model(

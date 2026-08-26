@@ -117,6 +117,9 @@ function categorizeKey(key: string): Section {
   if (key.startsWith('loss_by_group_ema/')) return 'group';
   if (key.startsWith('loss_by_group_reg_ema/')) return 'skip';
   if (key.includes('samples')) return 'skip';
+  // efficiency/* metrics have their own tab (JobEfficiency); mixed units
+  // (%, GB, counts) would pollute the shared-axis sections here
+  if (key.startsWith('efficiency/')) return 'skip';
   if (key === 'step_time_ms') return 'timing';
   if (key.includes('time') && key.includes('ms')) return 'timing';
   return 'other';
