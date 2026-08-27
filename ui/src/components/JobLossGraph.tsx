@@ -35,7 +35,7 @@ function emaSmoothPoints(points: { step: number; value: number }[], alpha: numbe
   return out;
 }
 
-function downsampleSeries(
+export function downsampleSeries(
   points: { step: number; value: number }[],
   targetN: number,
 ): { step: number; value: number }[] {

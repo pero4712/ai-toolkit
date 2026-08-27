@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Job } from '@prisma/client';
 import {
   ResponsiveContainer,
@@ -13,8 +13,9 @@ import {
   Legend,
   ReferenceLine,
 } from 'recharts';
-import useJobTimingLog from '@/hooks/useJobTimingLog';
+import useJobTimingLog, { TIMING_SERIES_KEYS } from '@/hooks/useJobTimingLog';
 import useMonitorStream from '@/hooks/useMonitorStream';
+import { downsampleSeries } from '@/components/JobLossGraph';
 
 // stacked step-phase series, bottom-up render order; palette matches JobLossGraph
 const PHASES: { key: string; name: string; color: string }[] = [
@@ -189,6 +190,78 @@ export default function JobEfficiency({ job }: { job: Job }) {
 
   const hasTimingData = chartData.length > 0;
 
+  // ---- export (same pattern as Loss Analysis: download or clipboard) ----
+  const [exportOpen, setExportOpen] = useState(false);
+  const exportRef = useRef<HTMLDivElement>(null);
+
+  const buildExportJson = useCallback(() => {
+    const lastStep = chartData.length ? chartData[chartData.length - 1].step : null;
+
+    const seriesOut: Record<string, { steps: number[]; values: number[] }> = {};
+    for (const key of TIMING_SERIES_KEYS) {
+      const pts = (series[key] ?? [])
+        .filter(p => p.value != null && Number.isFinite(p.value))
+        .map(p => ({ step: p.step, value: p.value as number }));
+      if (pts.length === 0) continue;
+      const ds = downsampleSeries(pts, 500);
+      seriesOut[key] = {
+        steps: ds.map(p => p.step),
+        values: ds.map(p => Math.round(p.value * 1000) / 1000),
+      };
+    }
+
+    const obj: Record<string, any> = {
+      job: job.name,
+      step: lastStep,
+      generated_at: new Date().toISOString(),
+      headline: {
+        step_time_ms: stepMs,
+        data_wait_pct: dataWaitPct,
+        gpu_busy_avg_pct: gpuBusyAvg != null ? Math.round(gpuBusyAvg * 10) / 10 : null,
+        vram_peak_gb: vramPeak,
+        expert_swaps_per_step: swapsPerStep,
+        i2v_cond_encode_ms: i2vCondMs,
+      },
+      warnings,
+      // live snapshot only: the monitor keeps a 2-minute rolling window
+      gpu_utilization_window: gpuSparklines.map(s => ({
+        gpu: s.label,
+        window_seconds: s.points.length
+          ? Math.round((s.points[s.points.length - 1].t - s.points[0].t) / 1000)
+          : 0,
+        avg_pct:
+          s.points.length > 0
+            ? Math.round((s.points.reduce((a, p) => a + p.load, 0) / s.points.length) * 10) / 10
+            : null,
+        idle_sample_pct:
+          s.points.length > 0
+            ? Math.round((s.points.filter(p => p.load < 10).length / s.points.length) * 1000) / 10
+            : null,
+      })),
+      series: seriesOut,
+    };
+    return JSON.stringify(obj, null, 2);
+  }, [chartData, series, job.name, stepMs, dataWaitPct, gpuBusyAvg, vramPeak, swapsPerStep, i2vCondMs, warnings, gpuSparklines]);
+
+  const handleDownload = useCallback(() => {
+    const json = buildExportJson();
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const lastStep = chartData.length ? chartData[chartData.length - 1].step : 0;
+    a.download = `efficiency-step${lastStep}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setExportOpen(false);
+  }, [buildExportJson, chartData]);
+
+  const handleCopy = useCallback(async () => {
+    const json = buildExportJson();
+    await navigator.clipboard.writeText(json);
+    setExportOpen(false);
+  }, [buildExportJson]);
+
   return (
     <div className="space-y-6 px-4 pb-8">
       <div className="flex items-center gap-3">
@@ -198,6 +271,31 @@ export default function JobEfficiency({ job }: { job: Job }) {
             No timing data yet — the trainer emits it every ~10 steps once training is running.
           </span>
         )}
+        <div className="flex-1" />
+        <div className="relative" ref={exportRef}>
+          <button
+            onClick={() => setExportOpen(v => !v)}
+            className="px-2 py-0.5 rounded text-xs font-medium bg-gray-800 text-gray-400 hover:text-gray-200 transition-colors"
+          >
+            Export JSON
+          </button>
+          {exportOpen && (
+            <div className="absolute right-0 top-full mt-1 z-20 bg-gray-800 border border-gray-700 rounded shadow-lg overflow-hidden">
+              <button
+                onClick={handleDownload}
+                className="block w-full text-left px-4 py-2 text-xs text-gray-300 hover:bg-gray-700 transition-colors whitespace-nowrap"
+              >
+                Download file
+              </button>
+              <button
+                onClick={handleCopy}
+                className="block w-full text-left px-4 py-2 text-xs text-gray-300 hover:bg-gray-700 transition-colors whitespace-nowrap"
+              >
+                Copy to clipboard
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Headline stats */}
