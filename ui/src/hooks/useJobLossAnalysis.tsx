@@ -17,6 +17,9 @@ export interface WorstVideo {
   trend_delta?: number;
   loss_ratio?: number;
   caption?: string | null;
+  // media path on the training machine; present in snapshots from tracker
+  // versions that record it — enables the play-clip button
+  source_path?: string | null;
 }
 
 export interface MatrixCell {

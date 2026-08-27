@@ -2,8 +2,17 @@
 
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { Job } from '@prisma/client';
+import { Play, X } from 'lucide-react';
 import useJobLossAnalysis, { MatrixCell, SummaryRow, WorstVideo } from '@/hooks/useJobLossAnalysis';
 import UniversalTable from './UniversalTable';
+import { encodeFilePathForUrl } from '@/utils/basic';
+
+const VIDEO_EXTS = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv'];
+
+function isVideoPath(p: string) {
+  const lower = p.toLowerCase();
+  return VIDEO_EXTS.some(ext => lower.endsWith(ext));
+}
 
 function formatNum(v: number) {
   if (!Number.isFinite(v)) return '';
@@ -68,8 +77,24 @@ function pivotMatrix(cells: MatrixCell[]) {
 }
 
 /** Shared columns for worst-video tables */
-function worstVideoColumns(compact = false) {
+function worstVideoColumns(compact = false, onPlay?: (row: WorstVideo) => void) {
   const cols: any[] = [
+    {
+      title: '',
+      key: 'play',
+      render: (row: WorstVideo) =>
+        row.source_path && onPlay ? (
+          <button
+            type="button"
+            onClick={() => onPlay(row)}
+            title={`Play ${row.source_path}`}
+            className="text-purple-400 hover:text-purple-200 transition-colors"
+          >
+            <Play className="w-3.5 h-3.5" />
+          </button>
+        ) : null,
+      className: 'w-6',
+    },
     { title: 'Source ID', key: 'source_id', className: 'font-mono' },
   ];
   if (!compact) {
@@ -145,6 +170,7 @@ function worstVideoColumns(compact = false) {
 export default function JobLossAnalysis({ job }: { job: Job }) {
   const { data, status, refresh } = useJobLossAnalysis(job.id, 10000);
   const [viewReg, setViewReg] = useState(false);
+  const [playerClip, setPlayerClip] = useState<WorstVideo | null>(null);
 
   // Effective view: force concept when no reg data exists
   const showReg = viewReg && !!data.has_reg_data;
@@ -849,9 +875,61 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
           <UniversalTable
             isLoading={status === 'loading'}
             onRefresh={refresh}
-            columns={worstVideoColumns(false)}
+            columns={worstVideoColumns(false, setPlayerClip)}
             rows={activeWorstVideos}
           />
+        </div>
+      )}
+
+      {/* Clip player overlay */}
+      {playerClip && playerClip.source_path && (
+        <div
+          className="fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-6"
+          onClick={() => setPlayerClip(null)}
+        >
+          <div
+            className="bg-gray-900 border border-gray-700 rounded-xl overflow-hidden max-w-4xl w-full"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-2 bg-gray-800">
+              <div className="min-w-0">
+                <p className="text-sm text-gray-200 font-mono truncate">{playerClip.source_id}</p>
+                <p className="text-xs text-gray-500 truncate" title={playerClip.source_path}>
+                  {playerClip.dataset_group} · mean {formatNum(playerClip.mean_loss_final)}
+                  {playerClip.mean_loss_raw != null && ` · raw ${formatNum(playerClip.mean_loss_raw)}`}
+                  {playerClip.z_score != null && ` · z ${playerClip.z_score.toFixed(1)}`}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPlayerClip(null)}
+                className="text-gray-400 hover:text-gray-100 ml-3 flex-shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="bg-black flex items-center justify-center" style={{ maxHeight: '70vh' }}>
+              {isVideoPath(playerClip.source_path) ? (
+                <video
+                  key={playerClip.source_path}
+                  src={`/api/files/${encodeFilePathForUrl(playerClip.source_path)}`}
+                  controls
+                  autoPlay
+                  loop
+                  className="max-h-[70vh] w-auto max-w-full"
+                />
+              ) : (
+                <img
+                  src={`/api/files/${encodeFilePathForUrl(playerClip.source_path)}`}
+                  alt={playerClip.source_id}
+                  className="max-h-[70vh] w-auto max-w-full object-contain"
+                />
+              )}
+            </div>
+            {playerClip.caption && (
+              <p className="px-4 py-2 text-xs text-gray-400 border-t border-gray-800">{playerClip.caption}</p>
+            )}
+          </div>
         </div>
       )}
 
@@ -869,7 +947,7 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
                 <UniversalTable
                   isLoading={status === 'loading'}
                   onRefresh={refresh}
-                  columns={worstVideoColumns(true)}
+                  columns={worstVideoColumns(true, setPlayerClip)}
                   rows={clips}
                 />
               </div>

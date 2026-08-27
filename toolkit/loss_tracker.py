@@ -170,6 +170,7 @@ class VideoStats:
         "total_count",
         "last_seen_step",
         "caption",
+        "source_path",
         "trend_means",
         "trend_steps",
         "was_outlier",
@@ -196,6 +197,8 @@ class VideoStats:
         self.total_count = 0
         self.last_seen_step = 0
         self.caption: Optional[str] = None
+        # media file path so the UI can play the clip from a worst-list row
+        self.source_path: Optional[str] = None
         self.trend_means: List[float] = []
         self.trend_steps: List[int] = []
         self.was_outlier: bool = False
@@ -696,6 +699,8 @@ class LossTracker:
         vs.add(event.loss_final, event.loss_raw, step)
         if vs.caption is None and event.caption:
             vs.caption = " ".join(event.caption.split())
+        if vs.source_path is None and event.source_path:
+            vs.source_path = event.source_path
 
     def _update_video_stats(self, event: LossEvent, step: int) -> None:
         norm_id = _normalize_source_id(event.source_id)
@@ -824,6 +829,7 @@ class LossTracker:
             "trend_delta": round(vs.trend_delta, 6),
             "loss_ratio": round(loss_ratio, 3),
             "caption": vs.caption,
+            "source_path": vs.source_path,
         }
 
     def get_worst_videos_extended(
@@ -1102,7 +1108,9 @@ class LossTracker:
                 sample["is_preservation"] = True
             if e.caption is not None:
                 sample["caption"] = e.caption
-            if e.source_path:
+            # events now always carry the path (for the UI's clip player);
+            # keep the JSONL lean unless debug payloads are requested
+            if self.config.debug and e.source_path:
                 sample["source_path"] = e.source_path
             samples.append(sample)
 

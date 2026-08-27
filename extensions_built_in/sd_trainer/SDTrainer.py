@@ -1039,7 +1039,7 @@ class SDTrainer(BaseSDTrainProcess):
                         loss_final=loss_final_list[i],
                         dataset_group=group_name,
                         source_id=file_item.source_id,
-                        source_path=file_item.path if self.loss_tracker.config.debug else "",
+                        source_path=file_item.path,
                         is_reg=file_item.is_reg,
                         timestep=t_val,
                         timestep_bucket=_bucket_timestep(
@@ -2288,7 +2288,7 @@ class SDTrainer(BaseSDTrainProcess):
                                         loss_final=pres_raw_list[i] * multiplier,
                                         dataset_group=group_name,
                                         source_id=file_item.source_id,
-                                        source_path=file_item.path if self.loss_tracker.config.debug else "",
+                                        source_path=file_item.path,
                                         is_reg=file_item.is_reg,
                                         timestep=t_val,
                                         timestep_bucket=_bucket_timestep(
