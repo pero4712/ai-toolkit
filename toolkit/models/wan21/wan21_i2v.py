@@ -282,6 +282,9 @@ class AggressiveWanI2VUnloadPipeline(WanImageToVideoPipeline):
 
 class Wan21I2V(Wan21):
     arch = 'wan21_i2v'
+    # generate_single_image raises without one; validated up front instead
+    requires_sample_ctrl_img = True
+
     def __init__(
             self,
             device,

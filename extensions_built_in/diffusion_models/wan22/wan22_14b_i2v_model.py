@@ -16,6 +16,9 @@ from .wan22_14b_model import Wan2214bModel
 
 class Wan2214bI2VModel(Wan2214bModel):
     arch = "wan22_14b_i2v"
+    # samples must carry a first frame; without one the conditioning channels
+    # are absent and the transformer input is malformed
+    requires_sample_ctrl_img = True
 
     def get_performance_logs(self) -> dict:
         logs = super().get_performance_logs()

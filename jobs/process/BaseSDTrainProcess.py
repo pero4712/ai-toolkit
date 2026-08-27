@@ -293,6 +293,70 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # override in subclass
         return generate_image_config_list
 
+    def validate_sample_config(self):
+        """Fail fast on sample configs the model cannot render.
+
+        Called before training starts (and before the first sample) so a bad
+        prompt aborts the job immediately instead of crashing hours later at
+        the first sample step.
+        """
+        if self.train_config.disable_sampling:
+            return
+
+        configs = [self.sample_config]
+        if self.has_first_sample_requested and self.first_sample_config is not self.sample_config:
+            configs.append(self.first_sample_config)
+
+        if not getattr(self.sd, 'requires_sample_ctrl_img', False):
+            return
+
+        problems = []
+        for sample_config in configs:
+            for idx, item in enumerate(sample_config.samples or []):
+                # a --ctrl_img flag in the prompt overrides the item field,
+                # matching GenerateImageConfig's prompt parsing
+                ctrl_img = item.ctrl_img
+                prompt = item.prompt or ''
+                for split in prompt.split('--')[1:]:
+                    flag = split.split(' ')[0].strip()
+                    if flag == 'ctrl_img':
+                        ctrl_img = split[len(flag):].strip()
+
+                short_prompt = (prompt[:60] + '...') if len(prompt) > 60 else prompt
+                if not ctrl_img:
+                    problems.append(
+                        f"  sample {idx + 1} (\"{short_prompt}\"): no control image"
+                    )
+                elif not os.path.exists(ctrl_img):
+                    problems.append(
+                        f"  sample {idx + 1} (\"{short_prompt}\"): control image not found: {ctrl_img}"
+                    )
+
+        if problems:
+            raise ValueError(
+                f"The {self.sd.arch} architecture conditions on a first frame, so every sample "
+                f"prompt needs a control image (the UI's per-sample control image picker, or "
+                f"--ctrl_img /path/to/image.png in the prompt).\n"
+                + "\n".join(problems)
+            )
+
+    def sample_safe(self, step=None, is_first=False):
+        """Sample, logging and swallowing any failure.
+
+        Preview generation must never take down a training run -- losing hours
+        of training to a bad sample prompt or a transient sampling OOM is far
+        worse than missing a preview.
+        """
+        try:
+            self.sample(step, is_first=is_first)
+        except Exception as e:
+            print_acc(f"\nWARNING: sampling failed at step {step} and was skipped: {e}")
+            traceback.print_exc()
+            try:
+                flush()
+            except Exception:
+                pass
+
     def sample(self, step=None, is_first=False):
         if not self.accelerator.is_main_process:
             return
@@ -2552,16 +2616,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Failed to compile model: {e}")
                     print_acc("Continuing without compilation")
 
+        # abort now if the sample config can never render (e.g. i2v without a
+        # control image) rather than failing at the first sample step
+        self.validate_sample_config()
+
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
-            self.sample(0, is_first=True)
+            self.sample_safe(0, is_first=True)
 
         # sample first
         if self.train_config.skip_first_sample or self.train_config.disable_sampling:
             print_acc("Skipping first sample due to config setting")
         elif self.step_num <= 1 or self.train_config.force_first_sample:
             print_acc("Generating baseline samples before training")
-            self.sample(self.step_num)
+            self.sample_safe(self.step_num)
         
         if self.accelerator.is_local_main_process:
             self.progress_bar = ToolkitProgressBar(
@@ -2820,7 +2888,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         # print above the progress bar
                         if self.train_config.free_u:
                             self.sd.pipeline.disable_freeu()
-                        self.sample(self.step_num)
+                        self.sample_safe(self.step_num)
                         if self.train_config.unload_text_encoder:
                             # make sure the text encoder is unloaded
                             self.sd.text_encoder_to('cpu')
@@ -2939,7 +3007,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.accelerator.is_main_process:
             self.save()
         if not self.train_config.disable_sampling:
-            self.sample(self.step_num)
+            self.sample_safe(self.step_num)
             self.logger.commit(step=self.step_num)
         print_acc("")
         if self.accelerator.is_main_process:

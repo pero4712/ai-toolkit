@@ -98,6 +98,10 @@ UNET_IN_CHANNELS = 4  # Stable Diffusion の in_channels は 4 で固定。XLも
 class BaseModel:
     # override these in child classes
     arch = None
+    # Archs that condition on a first frame (i2v) cannot sample without one.
+    # When True, the trainer validates every sample prompt has a readable
+    # ctrl_img before training starts.
+    requires_sample_ctrl_img = False
 
     def __init__(
             self,

@@ -228,7 +228,7 @@ class DiffusionTrainer(SDTrainer):
             self.optimizer.zero_grad()
             if self.train_config.free_u:
                 self.sd.pipeline.disable_freeu()
-            self.sample(self.step_num)
+            self.sample_safe(self.step_num)
             if self.train_config.unload_text_encoder:
                 # make sure the text encoder is unloaded
                 self.sd.text_encoder_to('cpu')
