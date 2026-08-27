@@ -16,6 +16,7 @@ import {
 import useJobTimingLog, { TIMING_SERIES_KEYS } from '@/hooks/useJobTimingLog';
 import useMonitorStream from '@/hooks/useMonitorStream';
 import { downsampleSeries } from '@/components/JobLossGraph';
+import { exportFileName } from '@/utils/basic';
 
 // stacked step-phase series, bottom-up render order; palette matches JobLossGraph
 const PHASES: { key: string; name: string; color: string }[] = [
@@ -250,11 +251,11 @@ export default function JobEfficiency({ job }: { job: Job }) {
     const a = document.createElement('a');
     a.href = url;
     const lastStep = chartData.length ? chartData[chartData.length - 1].step : 0;
-    a.download = `efficiency-step${lastStep}.json`;
+    a.download = exportFileName(job.name, 'efficiency', lastStep);
     a.click();
     URL.revokeObjectURL(url);
     setExportOpen(false);
-  }, [buildExportJson, chartData]);
+  }, [buildExportJson, chartData, job.name]);
 
   const handleCopy = useCallback(async () => {
     const json = buildExportJson();

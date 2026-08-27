@@ -5,7 +5,7 @@ import { Job } from '@prisma/client';
 import { Play, X } from 'lucide-react';
 import useJobLossAnalysis, { MatrixCell, SummaryRow, WorstVideo } from '@/hooks/useJobLossAnalysis';
 import UniversalTable from './UniversalTable';
-import { encodeFilePathForUrl } from '@/utils/basic';
+import { encodeFilePathForUrl, exportFileName } from '@/utils/basic';
 
 const VIDEO_EXTS = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv'];
 
@@ -459,11 +459,11 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `loss-analysis-step${data.step ?? 0}.json`;
+    a.download = exportFileName(job.name, 'loss-analysis', data.step);
     a.click();
     URL.revokeObjectURL(url);
     setExportOpen(false);
-  }, [buildExportJson, data.step]);
+  }, [buildExportJson, data.step, job.name]);
 
   const handleCopy = useCallback(async () => {
     const json = buildExportJson();

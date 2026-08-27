@@ -78,3 +78,12 @@ export const pathJoin = (...parts: string[]) => {
     .filter(part => part.length > 0)
     .join(sep);
 }
+
+/**
+ * Consistent filename for the JSON data exports (loss curves, loss analysis,
+ * efficiency): <job>_<kind>_step<step>.json
+ */
+export const exportFileName = (jobName: string, kind: string, step: number | null | undefined) => {
+  const safeJob = (jobName || 'job').replace(/[^a-zA-Z0-9._-]+/g, '_');
+  return `${safeJob}_${kind}_step${step ?? 0}.json`;
+};

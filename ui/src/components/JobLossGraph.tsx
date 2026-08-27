@@ -2,6 +2,7 @@
 
 import { Job } from '@prisma/client';
 import useJobLossLog, { LossPoint } from '@/hooks/useJobLossLog';
+import { exportFileName } from '@/utils/basic';
 import { useMemo, useState, useCallback, useRef } from 'react';
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, Legend } from 'recharts';
 
@@ -527,11 +528,11 @@ export default function JobLossGraph({ job }: { job: Job }) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `loss-curves-step${latestLoss?.step ?? 0}.json`;
+    a.download = exportFileName(job.name, 'loss-curves', latestLoss?.step);
     a.click();
     URL.revokeObjectURL(url);
     setExportOpen(false);
-  }, [buildExportJson, latestLoss]);
+  }, [buildExportJson, latestLoss, job.name]);
 
   const handleCopy = useCallback(async () => {
     const json = buildExportJson();
