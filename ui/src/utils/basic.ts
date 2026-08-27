@@ -80,10 +80,15 @@ export const pathJoin = (...parts: string[]) => {
 }
 
 /**
- * Consistent filename for the JSON data exports (loss curves, loss analysis,
- * efficiency): <job>_<kind>_step<step>.json
+ * Consistent filename for downloadable job data (JSON exports, checkpoints,
+ * optimizer state): <job>_<kind>_step<step>.<ext>
  */
-export const exportFileName = (jobName: string, kind: string, step: number | null | undefined) => {
+export const exportFileName = (
+  jobName: string,
+  kind: string,
+  step: number | null | undefined,
+  ext: string = 'json',
+) => {
   const safeJob = (jobName || 'job').replace(/[^a-zA-Z0-9._-]+/g, '_');
-  return `${safeJob}_${kind}_step${step ?? 0}.json`;
+  return `${safeJob}_${kind}_step${step ?? 0}.${ext}`;
 };

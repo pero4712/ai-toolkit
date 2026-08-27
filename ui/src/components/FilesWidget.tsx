@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import useFilesList from '@/hooks/useFilesList';
 import { Loader2, AlertCircle, Download, Box, Brain, Trash2, SlidersHorizontal } from 'lucide-react';
 import { openMergeLoRAsModal } from './MergeLoRAsModal';
-import { getFilename, getFoldername, encodeFilePathForUrl } from '@/utils/basic';
+import { getFilename, getFoldername, encodeFilePathForUrl, exportFileName } from '@/utils/basic';
 import { openConfirm } from './ConfirmModal';
 import { apiClient } from '@/utils/api';
 
@@ -34,6 +34,26 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
   const isOptimizerFile = (filePath: string) => getFilename(filePath) === 'optimizer.pt';
   const checkpointFiles = files.filter(file => !isOptimizerFile(file.path));
   const optimizerFile = files.find(file => isOptimizerFile(file.path));
+
+  // step parsed from the trainer's checkpoint naming (<job>_000000500.safetensors)
+  const stepFromCheckpoint = (filePath: string): number | null => {
+    const m = getFilename(filePath).match(/_(\d+)\.safetensors$/);
+    return m ? parseInt(m[1], 10) : null;
+  };
+
+  // aligned download name (<job>_<kind>_step<N>.<ext>) passed to the files
+  // route, which uses it for Content-Disposition; on-disk names are untouched
+  const downloadUrl = (filePath: string, kind: string, step: number | null, ext: string) => {
+    const base = `/api/files/${encodeFilePathForUrl(filePath)}`;
+    if (step == null) return base;
+    return `${base}?name=${encodeURIComponent(exportFileName(jobName, kind, step, ext))}`;
+  };
+
+  // optimizer.pt always corresponds to the most recent save
+  const latestStep = checkpointFiles.reduce<number | null>((acc, f) => {
+    const s = stepFromCheckpoint(f.path);
+    return s != null && (acc == null || s > acc) ? s : acc;
+  }, null);
 
   const cleanSize = (size: number) => {
     if (size < 1024) {
@@ -126,6 +146,7 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
             {checkpointFiles.map((file, index) => {
               const fileName = getFilename(file.path);
               const nameWithoutExt = fileName.replace('.safetensors', '');
+              const ckptUrl = downloadUrl(file.path, 'checkpoint', stepFromCheckpoint(file.path), 'safetensors');
               return (
                 <div
                   key={index}
@@ -133,7 +154,7 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
                 >
                   <a
                     target="_blank"
-                    href={`/api/files/${encodeFilePathForUrl(file.path)}`}
+                    href={ckptUrl}
                     className="flex items-center space-x-2 min-w-0 flex-1"
                   >
                     <Box className="w-4 h-4 text-purple-600 dark:text-purple-400 flex-shrink-0" />
@@ -150,7 +171,7 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
                     <span className="text-xs text-gray-400">{cleanSize(file.size)}</span>
                     <a
                       target="_blank"
-                      href={`/api/files/${encodeFilePathForUrl(file.path)}`}
+                      href={ckptUrl}
                       className="bg-purple-500 bg-opacity-0 group-hover:bg-opacity-10 rounded-full p-1 transition-all"
                     >
                       <Download className="w-3 h-3 text-purple-600 dark:text-purple-400" />
@@ -172,7 +193,7 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
               <div className="group flex items-center justify-between px-2 py-1.5 rounded-lg border-t border-gray-800 mt-1 pt-2 hover:bg-gray-800 transition-all duration-200">
                 <a
                   target="_blank"
-                  href={`/api/files/${encodeFilePathForUrl(optimizerFile.path)}`}
+                  href={downloadUrl(optimizerFile.path, 'optimizer', latestStep, 'pt')}
                   className="flex items-center space-x-2 min-w-0 flex-1"
                 >
                   <SlidersHorizontal className="w-4 h-4 text-amber-500 flex-shrink-0" />
@@ -187,7 +208,7 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
                   <span className="text-xs text-gray-400">{cleanSize(optimizerFile.size)}</span>
                   <a
                     target="_blank"
-                    href={`/api/files/${encodeFilePathForUrl(optimizerFile.path)}`}
+                    href={downloadUrl(optimizerFile.path, 'optimizer', latestStep, 'pt')}
                     className="bg-amber-500 bg-opacity-0 group-hover:bg-opacity-10 rounded-full p-1 transition-all"
                   >
                     <Download className="w-3 h-3 text-amber-500" />

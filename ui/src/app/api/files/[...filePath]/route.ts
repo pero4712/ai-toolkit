@@ -43,8 +43,13 @@ export async function GET(request: NextRequest, { params }: { params: { filePath
       return new NextResponse('Not a file', { status: 400 });
     }
 
-    // Get filename for Content-Disposition
-    const filename = path.basename(resolvedFilePath);
+    // Get filename for Content-Disposition. A `name` query param overrides the
+    // saved-as name (e.g. checkpoints download as <job>_checkpoint_step<N>)
+    // without touching the on-disk name that resume logic parses.
+    const requestedName = request.nextUrl.searchParams.get('name');
+    const filename = requestedName
+      ? path.basename(requestedName).replace(/[^a-zA-Z0-9._ -]+/g, '_')
+      : path.basename(resolvedFilePath);
 
     // Determine content type
     const ext = path.extname(resolvedFilePath).toLowerCase();
