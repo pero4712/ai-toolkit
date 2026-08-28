@@ -469,7 +469,9 @@ export default function JobLossGraph({ job }: { job: Job }) {
   );
 
   const latestLoss = useMemo(() => {
-    const s = perSeries['loss'];
+    // the trainer logs the main loss as `loss/loss`; bare `loss` is the
+    // fallback for runs logged by older versions
+    const s = perSeries['loss/loss'] ?? perSeries['loss'];
     if (!s) return null;
     const last = s.smooth.length ? s.smooth[s.smooth.length - 1] : (s.raw.length ? s.raw[s.raw.length - 1] : null);
     return last;
