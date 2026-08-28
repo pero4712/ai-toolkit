@@ -109,7 +109,9 @@ function strokeForKey(key: string) {
 type Section = 'overall' | 'noise' | 'boundary' | 'group' | 'other' | 'timing' | 'skip';
 
 function categorizeKey(key: string): Section {
-  if (key === 'loss') return 'overall';
+  // the trainer logs the main loss as `loss/loss`; bare `loss` is the
+  // fallback for runs logged by older versions
+  if (key === 'loss' || key === 'loss/loss') return 'overall';
   if (key.startsWith('loss_by_reg_ema/')) return 'overall';
   if (key.startsWith('loss_by_noise_ema/')) return 'noise';
   if (key.startsWith('loss_by_noise_reg_ema/')) return 'skip';
@@ -133,7 +135,7 @@ function groupNameFromKey(key: string): string {
 
 /** Friendly display name for a loss key */
 function displayName(key: string): string {
-  if (key === 'loss') return 'loss';
+  if (key === 'loss' || key === 'loss/loss') return 'loss';
   // strip common prefixes for readability
   for (const prefix of ['loss_by_reg_ema/', 'loss_by_noise_ema/', 'loss_by_boundary/', 'loss_by_group_ema/']) {
     if (key.startsWith(prefix)) return key.slice(prefix.length);
