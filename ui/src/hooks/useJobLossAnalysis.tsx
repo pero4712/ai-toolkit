@@ -29,7 +29,7 @@ export interface MatrixCell {
 }
 
 export interface SummaryRow {
-  type: 'group' | 'noise' | 'boundary';
+  type: 'group' | 'noise' | 'boundary' | 'phase' | 'level';
   name: string;
   ema_200: number;
   sample_count: number;
@@ -41,6 +41,67 @@ export interface SummaryRow {
   // group rows only, tracker >= preservation extension
   ema_200_raw?: number;
   loss_multiplier?: number;
+  // dropped-caption companion (unconditional draws), tracker >= manifest P2
+  dropped_ema_200?: number;
+  dropped_samples?: number;
+}
+
+/** Manifest-driven dataset diagnostics (loss_analysis.json sections) */
+export interface ExposureRow {
+  name: string;
+  files: number;
+  copies?: number;
+  draws: number;
+  reg_draws: number;
+  expected_share: number | null;
+  realized_share: number | null;
+  ratio: number | null;
+  expected_draws?: number | null;
+}
+export interface InterleavingRow {
+  folder: string;
+  epoch: number | null;
+  draws: number;
+  groups: number;
+  adjacency_rate: number | null;
+  baseline_rate: number | null;
+  ratio: number | null;
+  flagged: boolean;
+}
+export interface WindowCoverageRow {
+  folder: string;
+  files: number;
+  draws: number;
+  files_scored: number;
+  mean_uniformity: number | null;
+  files_single_bin: number;
+  flagged: boolean;
+}
+export interface WindowFileRow {
+  source_id: string;
+  folder: string;
+  draws: number;
+  max_start: number;
+  bins: number[];
+  uniformity: number | null;
+}
+export interface DropoutRow {
+  folder: string;
+  draws: number;
+  caption_dropped: number;
+  realized_rate: number | null;
+  configured_rate: number;
+  ratio: number | null;
+  token_dropout_rate: number;
+  flagged: boolean;
+}
+export interface DuplicateRow {
+  base: string;
+  base_draws: number;
+  copies: Record<string, number>;
+  min_ratio: number | null;
+  max_ratio: number | null;
+  flagged: boolean;
 }
 
 export interface LossAnalysisData {
@@ -76,6 +137,21 @@ export interface LossAnalysisData {
   preservation_summary_reg?: SummaryRow[];
   preservation_matrix_concept?: MatrixCell[];
   preservation_matrix_reg?: MatrixCell[];
+  // Manifest-driven diagnostics
+  exposure?: {
+    epoch: number | null;
+    total_draws: number;
+    joined_draws: number;
+    unjoined_draws: number;
+    manifest_files: number;
+    by_semantic_group: ExposureRow[];
+    by_source_take: ExposureRow[];
+  };
+  interleaving?: { epoch: number | null; by_folder: InterleavingRow[]; any_flagged: boolean };
+  window_coverage?: { by_folder: WindowCoverageRow[]; least_uniform_files: WindowFileRow[]; any_flagged: boolean };
+  dropout?: { by_folder: DropoutRow[]; any_flagged: boolean; note?: string };
+  duplicates?: { pairs: DuplicateRow[]; any_flagged: boolean };
+  provenance?: Record<string, any>;
   // Group-level stats
   group_stats?: Record<string, { mean: number; std: number; min: number; max: number; clip_count: number }>;
 }

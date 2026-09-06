@@ -54,6 +54,21 @@ function TrendCell({ row }: { row: WorstVideo }) {
   return <span className={TREND_COLORS[t] ?? 'text-gray-600'}>{TREND_ARROWS[t] ?? '~'}</span>;
 }
 
+// --- cell helpers for the manifest diagnostics tables ---
+const pctCell = (key: string) => (row: any) =>
+  row[key] != null ? `${(row[key] * 100).toFixed(1)}%` : '—';
+const numCell = (key: string) => (row: any) => (row[key] != null ? formatNum(row[key]) : '—');
+const ratioCell = (row: any) => {
+  if (row.ratio == null) return '—';
+  const off = Math.abs(row.ratio - 1) > 0.5;
+  return <span className={off ? 'text-amber-400' : ''}>{row.ratio.toFixed(2)}×</span>;
+};
+const flagCell = (row: any) =>
+  row.flagged ? <span className="text-red-400 font-medium">flag</span> : null;
+function FlagTag() {
+  return <span className="ml-2 text-red-400 font-medium">flagged</span>;
+}
+
 /** Pivot flat matrix cells into { group → { bucket → value } } */
 function pivotMatrix(cells: MatrixCell[]) {
   const groups = new Set<string>();
@@ -207,6 +222,10 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
   );
   const noiseSummary = useMemo(
     () => activeSummary.filter(r => r.type === 'noise' || r.type === 'boundary'),
+    [activeSummary],
+  );
+  const cohortSummary = useMemo(
+    () => activeSummary.filter(r => r.type === 'phase' || r.type === 'level'),
     [activeSummary],
   );
 
@@ -450,6 +469,12 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
       }
     }
 
+    const diagnostics: Record<string, any> = {};
+    for (const key of ['exposure', 'interleaving', 'window_coverage', 'dropout', 'duplicates', 'provenance'] as const) {
+      if ((data as any)[key] != null) diagnostics[key] = (data as any)[key];
+    }
+    if (Object.keys(diagnostics).length > 0) obj.diagnostics = diagnostics;
+
     return JSON.stringify(obj, null, 2);
   }, [data]);
 
@@ -613,6 +638,19 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
                       className: 'text-right font-mono text-gray-400',
                     },
                     {
+                      title: 'Dropped',
+                      key: 'dropped_ema_200',
+                      render: (row: any) =>
+                        row.dropped_ema_200 != null ? (
+                          <span title={`${row.dropped_samples ?? 0} dropped-caption draws`}>
+                            {formatNum(row.dropped_ema_200)}
+                          </span>
+                        ) : (
+                          ''
+                        ),
+                      className: 'text-right font-mono text-gray-400',
+                    },
+                    {
                       title: 'Mult',
                       key: 'loss_multiplier',
                       render: (row: any) =>
@@ -675,6 +713,187 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
                     },
                   ]}
                   rows={noiseSummary}
+                />
+              </div>
+            )}
+            {cohortSummary.length > 0 && (
+              <div>
+                <p className="text-xs text-gray-500 mb-1">By Phase / Level (manifest)</p>
+                <UniversalTable
+                  isLoading={status === 'loading'}
+                  onRefresh={refresh}
+                  columns={[
+                    { title: 'Axis', key: 'type' },
+                    { title: 'Name', key: 'name' },
+                    {
+                      title: 'EMA-200',
+                      key: 'ema_200',
+                      render: (row: any) => formatNum(row.ema_200),
+                      className: 'text-right font-mono',
+                    },
+                    {
+                      title: 'Dropped',
+                      key: 'dropped_ema_200',
+                      render: (row: any) => (row.dropped_ema_200 != null ? formatNum(row.dropped_ema_200) : ''),
+                      className: 'text-right font-mono text-gray-400',
+                    },
+                    {
+                      title: 'Samples',
+                      key: 'sample_count',
+                      render: (row: any) => row.sample_count.toLocaleString(),
+                      className: 'text-right',
+                    },
+                  ]}
+                  rows={cohortSummary}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Dataset diagnostics (manifest-driven) */}
+      {(data.exposure || data.interleaving || data.window_coverage || data.dropout || data.duplicates) && (
+        <div>
+          <h3 className="text-sm font-medium text-gray-300 mb-2">
+            Dataset Diagnostics{' '}
+            <span className="text-gray-500 font-normal">
+              (manifest join: {data.exposure?.joined_draws?.toLocaleString() ?? 0} of{' '}
+              {data.exposure?.total_draws?.toLocaleString() ?? 0} draws attributed)
+            </span>
+          </h3>
+          <div className="space-y-4">
+            {data.exposure && data.exposure.by_semantic_group.length > 0 && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">Exposure by semantic group (realized vs design share)</p>
+                  <UniversalTable
+                    isLoading={status === 'loading'}
+                    onRefresh={refresh}
+                    columns={[
+                      { title: 'Group', key: 'name' },
+                      { title: 'Files', key: 'files', className: 'text-right' },
+                      { title: 'Draws', key: 'draws', className: 'text-right' },
+                      { title: 'Expected', key: 'expected_share', render: pctCell('expected_share'), className: 'text-right font-mono' },
+                      { title: 'Realized', key: 'realized_share', render: pctCell('realized_share'), className: 'text-right font-mono' },
+                      { title: 'Ratio', key: 'ratio', render: ratioCell, className: 'text-right font-mono' },
+                    ]}
+                    rows={data.exposure.by_semantic_group}
+                  />
+                </div>
+                {data.exposure.by_source_take.length > 0 && (
+                  <div>
+                    <p className="text-xs text-gray-500 mb-1">Exposure by source take (copies collapse duplicates)</p>
+                    <UniversalTable
+                      isLoading={status === 'loading'}
+                      onRefresh={refresh}
+                      columns={[
+                        { title: 'Take', key: 'name' },
+                        { title: 'Files', key: 'files', className: 'text-right' },
+                        { title: 'Copies', key: 'copies', className: 'text-right' },
+                        { title: 'Draws', key: 'draws', className: 'text-right' },
+                        { title: 'Realized', key: 'realized_share', render: pctCell('realized_share'), className: 'text-right font-mono' },
+                        { title: 'Ratio', key: 'ratio', render: ratioCell, className: 'text-right font-mono' },
+                      ]}
+                      rows={data.exposure.by_source_take}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+            {data.interleaving && data.interleaving.by_folder.length > 0 && (
+              <div>
+                <p className="text-xs text-gray-500 mb-1">
+                  Draw interleaving per pooled folder (same-group adjacency vs shuffled baseline)
+                  {data.interleaving.any_flagged && <FlagTag />}
+                </p>
+                <UniversalTable
+                  isLoading={status === 'loading'}
+                  onRefresh={refresh}
+                  columns={[
+                    { title: 'Folder', key: 'folder' },
+                    { title: 'Epoch', key: 'epoch', render: (r: any) => r.epoch ?? '—', className: 'text-right' },
+                    { title: 'Draws', key: 'draws', className: 'text-right' },
+                    { title: 'Groups', key: 'groups', className: 'text-right' },
+                    { title: 'Adjacency', key: 'adjacency_rate', render: pctCell('adjacency_rate'), className: 'text-right font-mono' },
+                    { title: 'Baseline', key: 'baseline_rate', render: pctCell('baseline_rate'), className: 'text-right font-mono' },
+                    { title: 'Ratio', key: 'ratio', render: ratioCell, className: 'text-right font-mono' },
+                    { title: '', key: 'flagged', render: flagCell },
+                  ]}
+                  rows={data.interleaving.by_folder}
+                />
+              </div>
+            )}
+            {data.window_coverage && data.window_coverage.by_folder.length > 0 && (
+              <div>
+                <p className="text-xs text-gray-500 mb-1">
+                  Sliding-window coverage (uniformity of window starts over each clip's legal range)
+                  {data.window_coverage.any_flagged && <FlagTag />}
+                </p>
+                <UniversalTable
+                  isLoading={status === 'loading'}
+                  onRefresh={refresh}
+                  columns={[
+                    { title: 'Folder', key: 'folder' },
+                    { title: 'Files', key: 'files', className: 'text-right' },
+                    { title: 'Scored', key: 'files_scored', className: 'text-right' },
+                    { title: 'Draws', key: 'draws', className: 'text-right' },
+                    { title: 'Uniformity', key: 'mean_uniformity', render: numCell('mean_uniformity'), className: 'text-right font-mono' },
+                    { title: 'Single-bin', key: 'files_single_bin', className: 'text-right' },
+                    { title: '', key: 'flagged', render: flagCell },
+                  ]}
+                  rows={data.window_coverage.by_folder}
+                />
+              </div>
+            )}
+            {data.dropout && data.dropout.by_folder.length > 0 && (
+              <div>
+                <p className="text-xs text-gray-500 mb-1">
+                  Caption dropout realized vs configured
+                  {data.dropout.any_flagged && <FlagTag />}
+                </p>
+                <UniversalTable
+                  isLoading={status === 'loading'}
+                  onRefresh={refresh}
+                  columns={[
+                    { title: 'Folder', key: 'folder' },
+                    { title: 'Draws', key: 'draws', className: 'text-right' },
+                    { title: 'Dropped', key: 'caption_dropped', className: 'text-right' },
+                    { title: 'Realized', key: 'realized_rate', render: pctCell('realized_rate'), className: 'text-right font-mono' },
+                    { title: 'Configured', key: 'configured_rate', render: pctCell('configured_rate'), className: 'text-right font-mono' },
+                    { title: 'Ratio', key: 'ratio', render: ratioCell, className: 'text-right font-mono' },
+                    { title: '', key: 'flagged', render: flagCell },
+                  ]}
+                  rows={data.dropout.by_folder}
+                />
+              </div>
+            )}
+            {data.duplicates && data.duplicates.pairs.length > 0 && (
+              <div>
+                <p className="text-xs text-gray-500 mb-1">
+                  Duplicate integrity (share copies vs their base)
+                  {data.duplicates.any_flagged && <FlagTag />}
+                </p>
+                <UniversalTable
+                  isLoading={status === 'loading'}
+                  onRefresh={refresh}
+                  columns={[
+                    { title: 'Base', key: 'base', className: 'font-mono' },
+                    { title: 'Base draws', key: 'base_draws', className: 'text-right' },
+                    {
+                      title: 'Copies',
+                      key: 'copies',
+                      render: (r: any) =>
+                        Object.entries(r.copies as Record<string, number>)
+                          .map(([k, v]) => `${k}: ${v}`)
+                          .join(', '),
+                      className: 'font-mono text-xs',
+                    },
+                    { title: 'Min ratio', key: 'min_ratio', render: numCell('min_ratio'), className: 'text-right font-mono' },
+                    { title: 'Max ratio', key: 'max_ratio', render: numCell('max_ratio'), className: 'text-right font-mono' },
+                    { title: '', key: 'flagged', render: flagCell },
+                  ]}
+                  rows={data.duplicates.pairs}
                 />
               </div>
             )}

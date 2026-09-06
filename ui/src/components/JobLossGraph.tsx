@@ -121,6 +121,7 @@ function categorizeKey(key: string): Section {
   if (key.startsWith('loss_by_group_reg_ema/')) return 'skip';
   if (key.startsWith('loss_by_phase_reg_ema/')) return 'skip';
   if (key.startsWith('loss_by_level_reg_ema/')) return 'skip';
+  if (key.includes('_dropped_reg_ema/')) return 'skip';
   if (key.includes('samples')) return 'skip';
   // efficiency/* metrics have their own tab (JobEfficiency); mixed units
   // (%, GB, counts) would pollute the shared-axis sections here
@@ -138,6 +139,9 @@ function groupNameFromKey(key: string): string {
 /** Friendly display name for a loss key */
 function displayName(key: string): string {
   if (key === 'loss' || key === 'loss/loss') return 'loss';
+  // dropped-caption companion series: "<cohort> (dropped)"
+  const dropped = key.match(/^loss_by_(group|phase|level)_dropped_ema\/(.+)$/);
+  if (dropped) return `${dropped[2]} (dropped)`;
   // strip common prefixes for readability
   for (const prefix of ['loss_by_reg_ema/', 'loss_by_noise_ema/', 'loss_by_boundary/', 'loss_by_group_ema/', 'loss_by_phase_ema/', 'loss_by_level_ema/']) {
     if (key.startsWith(prefix)) return key.slice(prefix.length);

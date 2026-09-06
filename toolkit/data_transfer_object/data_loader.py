@@ -193,6 +193,7 @@ class FileItemDTO(
         # selection is deterministic or the item is not a video)
         self.window_start: Optional[int] = None
         self.window_interval: Optional[int] = None
+        self.window_max_start: Optional[int] = None
         self.prior_reg = self.dataset_config.prior_reg
         self.tensor: Union[torch.Tensor, None] = None
         self.audio_data = None

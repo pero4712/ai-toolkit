@@ -144,6 +144,7 @@ class LossEvent:
     # runtime sliding-window draw: the one signal only the trainer can log
     window_start: Optional[int] = None
     window_interval: Optional[int] = None
+    window_max_start: Optional[int] = None  # legal range of the draw; enables coverage (check 3)
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +374,19 @@ class LossTracker:
         # Check 2: same-semantic-group adjacency per pooled folder per epoch
         self._interleave: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
+        # Check 3: window coverage per runtime-sliding clip (8 bins over [0, max_start])
+        self._window_cov: Dict[str, Dict[str, Any]] = {}
+        # Check 4: dropped-caption companion EMAs, keyed (family, key, is_reg)
+        self._dropped_emas_by_reg: Dict[Tuple[str, str, bool], EMAScalar] = {}
+        self._dropped_counts_by_reg: Dict[Tuple[str, str, bool], int] = defaultdict(int)
+        # Check 6: realized caption dropout per folder
+        self._dropout: Dict[str, Dict[str, Any]] = {}
+        # Check 7: duplicate integrity, base clip -> {copy name -> draws}
+        self._dup_draws: Dict[str, Dict[str, int]] = {}
+        # Check 8: preservation by phase
+        self._pres_phase_emas_by_reg: Dict[Tuple[str, bool], EMAScalar] = {}
+        self._pres_phase_sample_counts_by_reg: Dict[Tuple[str, bool], int] = defaultdict(int)
+
         # Whether any reg data has been seen
         self._has_reg_data = False
 
@@ -444,6 +458,7 @@ class LossTracker:
             "folder_group": folder_group,
             "window_start": getattr(file_item, "window_start", None),
             "window_interval": getattr(file_item, "window_interval", None),
+            "window_max_start": getattr(file_item, "window_max_start", None),
         }
         manifest = self.manifest
         if manifest is None:
@@ -555,10 +570,16 @@ class LossTracker:
             metrics[f"loss_by_reg_ema/{reg_tag}"] = self._reg_ema_200[is_reg].value
             metrics[f"samples_by_reg/{reg_tag}"] = float(len(split_events))
 
-            # Per-group breakdown (concept = default keys, reg = _reg_ keys)
+            # Per-group breakdown (concept = default keys, reg = _reg_ keys).
+            # Dropped-caption draws are unconditional samples with a different
+            # loss distribution: they feed a companion series (check 4) instead
+            # of blurring the cohort curves.
             group_events: Dict[str, List[LossEvent]] = defaultdict(list)
+            dropped_group_events: Dict[str, List[LossEvent]] = defaultdict(list)
             for e in split_events:
-                group_events[e.dataset_group].append(e)
+                (dropped_group_events if e.is_caption_dropped else group_events)[e.dataset_group].append(e)
+            for group, evs in dropped_group_events.items():
+                self._update_dropped("group", self._get_sanitized_group(group), is_reg, evs, metrics)
             for group, evs in group_events.items():
                 losses = [e.loss_final for e in evs]
                 g_key = self._get_sanitized_group(group)
@@ -585,10 +606,18 @@ class LossTracker:
                 ("level", self._level_emas_by_reg, self._level_sample_counts_by_reg, "loss_by_level"),
             ):
                 axis_losses: Dict[str, List[float]] = defaultdict(list)
+                axis_dropped: Dict[str, List[LossEvent]] = defaultdict(list)
                 for e in split_events:
                     val = getattr(e, attr)
-                    if val:
+                    if not val:
+                        continue
+                    if e.is_caption_dropped:
+                        axis_dropped[val].append(e)
+                    else:
                         axis_losses[val].append(e.loss_final)
+                family = "phase" if attr == "phase_type" else "level"
+                for name, evs in axis_dropped.items():
+                    self._update_dropped(family, self._get_sanitized_group(name), is_reg, evs, metrics)
                 for name, losses in axis_losses.items():
                     a_key = self._get_sanitized_group(name)
                     key = (a_key, is_reg)
@@ -679,6 +708,9 @@ class LossTracker:
                     continue
                 metric_key = f"{key_prefix}_reg_ema/{a_key}" if is_reg else f"{key_prefix}_ema/{a_key}"
                 metrics.setdefault(metric_key, ema.value)
+        for (family, a_key, is_reg), ema in self._dropped_emas_by_reg.items():
+            if ema._initialized:
+                metrics.setdefault(self._dropped_metric_key(family, a_key, is_reg), ema.value)
 
         # Ratio metrics (only when both sides have data this step)
         concept_count = len(events_by_reg.get(False, []))
@@ -692,6 +724,8 @@ class LossTracker:
 
         # Manifest checks 1 and 2 (normal-loss draws, in draw order)
         self._update_exposure_and_interleaving(events, self.current_epoch)
+        # Checks 3, 6, 7: window coverage, realized dropout, duplicate integrity
+        self._update_p2_checks(events)
 
         # Preservation-loss aggregation (separate metric family)
         if pres_events:
@@ -742,6 +776,19 @@ class LossTracker:
                 self._pres_group_sample_counts_by_reg[key] += len(losses)
                 metrics[f"preservation_by_group{reg_suffix}_ema/{g_key}"] = self._pres_group_emas_by_reg[key].value
 
+            phase_losses: Dict[str, List[float]] = defaultdict(list)
+            for e in split_events:
+                if e.phase_type:
+                    phase_losses[e.phase_type].append(e.loss_final)
+            for name, losses in phase_losses.items():
+                p_key = self._get_sanitized_group(name)
+                key = (p_key, is_reg)
+                if key not in self._pres_phase_emas_by_reg:
+                    self._pres_phase_emas_by_reg[key] = EMAScalar(span=200)
+                self._pres_phase_emas_by_reg[key].update(sum(losses) / len(losses))
+                self._pres_phase_sample_counts_by_reg[key] += len(losses)
+                metrics[f"preservation_by_phase{reg_suffix}_ema/{p_key}"] = self._pres_phase_emas_by_reg[key].value
+
             bucket_losses: Dict[str, List[float]] = defaultdict(list)
             for e in split_events:
                 bucket_losses[e.timestep_bucket].append(e.loss_final)
@@ -785,6 +832,10 @@ class LossTracker:
             if ema._initialized:
                 reg_suffix = "_reg" if is_reg else ""
                 metrics.setdefault(f"preservation_by_noise{reg_suffix}_ema/{bucket}", ema.value)
+        for (p_key, is_reg), ema in self._pres_phase_emas_by_reg.items():
+            if ema._initialized:
+                reg_suffix = "_reg" if is_reg else ""
+                metrics.setdefault(f"preservation_by_phase{reg_suffix}_ema/{p_key}", ema.value)
         for (bidx, is_reg), ema in self._pres_boundary_emas_by_reg.items():
             if ema._initialized:
                 reg_suffix = "_reg" if is_reg else ""
@@ -827,6 +878,9 @@ class LossTracker:
             vs.source_path = event.source_path
 
     def _update_video_stats(self, event: LossEvent, step: int) -> None:
+        if event.is_caption_dropped:
+            # unconditional draws would distort per-clip means and worst-lists
+            return
         if event.is_manifest_joined and event.clip_key:
             # manifest identity: share copies collapse onto their base segment
             # (via duplicate_of), and the per-take aggregate replaces the
@@ -1363,6 +1417,187 @@ class LossTracker:
             "any_flagged": any(r["flagged"] for r in rows),
         }
 
+    # -- check 4 helpers ----------------------------------------------------
+
+    @staticmethod
+    def _dropped_metric_key(family: str, key: str, is_reg: bool) -> str:
+        prefix = {"group": "loss_by_group", "phase": "loss_by_phase", "level": "loss_by_level"}[family]
+        return f"{prefix}_dropped{'_reg' if is_reg else ''}_ema/{key}"
+
+    def _update_dropped(
+        self, family: str, key: str, is_reg: bool, evs: List[LossEvent], metrics: Dict[str, float],
+    ) -> None:
+        k = (family, key, is_reg)
+        if k not in self._dropped_emas_by_reg:
+            self._dropped_emas_by_reg[k] = EMAScalar(span=200)
+        self._dropped_emas_by_reg[k].update(sum(e.loss_final for e in evs) / len(evs))
+        self._dropped_counts_by_reg[k] += len(evs)
+        metrics[self._dropped_metric_key(family, key, is_reg)] = self._dropped_emas_by_reg[k].value
+
+    def _attach_dropped(self, row: Dict[str, Any], family: str, key: str, is_reg: bool) -> None:
+        ema = self._dropped_emas_by_reg.get((family, key, is_reg))
+        if ema is not None and ema._initialized:
+            row["dropped_ema_200"] = round(ema.value, 6)
+            row["dropped_samples"] = self._dropped_counts_by_reg.get((family, key, is_reg), 0)
+
+    # -- checks 3, 6, 7 -------------------------------------------------------
+
+    def _update_p2_checks(self, events: List[LossEvent]) -> None:
+        """Bookkeeping for window coverage, realized dropout, duplicate integrity."""
+        for e in events:
+            folder = e.folder_group or e.dataset_group
+
+            # check 6: realized caption dropout per folder (token dropout happens
+            # inside the caption text and is not observable per draw)
+            d = self._dropout.get(folder)
+            if d is None:
+                d = {"draws": 0, "dropped": 0, "configured": 0.0, "token_rate": 0.0}
+                self._dropout[folder] = d
+            d["draws"] += 1
+            if e.is_caption_dropped:
+                d["dropped"] += 1
+            d["configured"] = float(e.caption_dropout_rate or 0.0)
+            d["token_rate"] = float(e.token_dropout_rate or 0.0)
+
+            # check 7: share copies must draw about as often as their base
+            base = e.clip_name if (e.is_manifest_joined and e.clip_name) else _normalize_source_id(e.source_id)
+            if base:
+                copies = self._dup_draws.setdefault(base, {})
+                copies[e.source_id] = copies.get(e.source_id, 0) + 1
+
+            # check 3: window_start histogram over the legal range
+            if (
+                e.window_start is not None
+                and e.window_max_start is not None
+                and e.window_max_start > 0
+            ):
+                cid = e.clip_key or _normalize_source_id(e.source_id)
+                w = self._window_cov.get(cid)
+                if w is None:
+                    if len(self._window_cov) >= self.config.max_tracked_videos:
+                        continue
+                    w = {
+                        "name": e.clip_name or e.source_id,
+                        "folder": folder,
+                        "max_start": e.window_max_start,
+                        "bins": [0] * 8,
+                        "draws": 0,
+                    }
+                    self._window_cov[cid] = w
+                w["max_start"] = max(w["max_start"], e.window_max_start)
+                b = min(7, int(e.window_start * 8 / (e.window_max_start + 1)))
+                w["bins"][b] += 1
+                w["draws"] += 1
+
+    def _window_coverage_snapshot(self) -> Dict[str, Any]:
+        """Check 3: is the sliding-window sampler covering each clip's legal range?
+
+        Uniformity is the normalized entropy of the 8-bin window_start
+        histogram (1.0 = uniform). A biased sampler shows as low uniformity
+        or files stuck in a single bin.
+        """
+        def uniformity(bins: List[int]) -> Optional[float]:
+            n = sum(bins)
+            if n == 0:
+                return None
+            ps = [c / n for c in bins if c > 0]
+            h = -sum(p * math.log(p) for p in ps)
+            return h / math.log(len(bins))
+
+        folders: Dict[str, Dict[str, Any]] = {}
+        files = []
+        for w in self._window_cov.values():
+            u = uniformity(w["bins"])
+            f = folders.setdefault(
+                w["folder"], {"files": 0, "draws": 0, "uniformity_sum": 0.0, "scored": 0, "single_bin": 0}
+            )
+            f["files"] += 1
+            f["draws"] += w["draws"]
+            scored = w["draws"] >= 8 and u is not None
+            if scored:
+                f["scored"] += 1
+                f["uniformity_sum"] += u
+                if sum(1 for c in w["bins"] if c) == 1:
+                    f["single_bin"] += 1
+            files.append({
+                "source_id": w["name"],
+                "folder": w["folder"],
+                "draws": w["draws"],
+                "max_start": w["max_start"],
+                "bins": list(w["bins"]),
+                "uniformity": self._r4(u),
+            })
+        by_folder = []
+        for name, f in sorted(folders.items()):
+            mean_u = f["uniformity_sum"] / f["scored"] if f["scored"] else None
+            by_folder.append({
+                "folder": name,
+                "files": f["files"],
+                "draws": f["draws"],
+                "files_scored": f["scored"],
+                "mean_uniformity": self._r4(mean_u),
+                "files_single_bin": f["single_bin"],
+                "flagged": bool(f["scored"] >= 5 and mean_u is not None and mean_u < 0.7),
+            })
+        scored_files = [r for r in files if r["draws"] >= 8 and r["uniformity"] is not None]
+        scored_files.sort(key=lambda r: (r["uniformity"], -r["draws"]))
+        return {
+            "by_folder": by_folder,
+            "least_uniform_files": scored_files[:20],
+            "any_flagged": any(r["flagged"] for r in by_folder),
+        }
+
+    def _dropout_snapshot(self) -> Dict[str, Any]:
+        """Check 6: observed caption-dropout frequency per folder vs configured."""
+        rows = []
+        for folder, d in sorted(self._dropout.items()):
+            realized = d["dropped"] / d["draws"] if d["draws"] else None
+            configured = d["configured"]
+            ratio = (realized / configured) if (realized is not None and configured > 0) else None
+            flagged = bool(
+                d["draws"] >= 100 and configured > 0 and ratio is not None and abs(ratio - 1.0) > 0.5
+            )
+            rows.append({
+                "folder": folder,
+                "draws": d["draws"],
+                "caption_dropped": d["dropped"],
+                "realized_rate": self._r4(realized),
+                "configured_rate": configured,
+                "ratio": round(ratio, 3) if ratio is not None else None,
+                "token_dropout_rate": d["token_rate"],
+                "flagged": flagged,
+            })
+        return {
+            "by_folder": rows,
+            "any_flagged": any(r["flagged"] for r in rows),
+            "note": "token dropout acts inside the caption and is not observable per draw; only its configured rate is echoed",
+        }
+
+    def _duplicates_snapshot(self) -> Dict[str, Any]:
+        """Check 7: _dupN / duplicate_of copies draw about as often as their base."""
+        pairs = []
+        for base, copies in sorted(self._dup_draws.items()):
+            if len(copies) < 2:
+                continue
+            base_draws = copies.get(base, 0)
+            others = {k: v for k, v in copies.items() if k != base}
+            ref = base_draws if base_draws > 0 else max(copies.values())
+            ratios = [v / ref for v in others.values()] if ref else []
+            min_ratio = min(ratios) if ratios else None
+            max_ratio = max(ratios) if ratios else None
+            flagged = bool(
+                ref >= 10 and min_ratio is not None and (min_ratio < 0.5 or max_ratio > 2.0)
+            )
+            pairs.append({
+                "base": base,
+                "base_draws": base_draws,
+                "copies": others,
+                "min_ratio": self._r4(min_ratio),
+                "max_ratio": self._r4(max_ratio),
+                "flagged": flagged,
+            })
+        return {"pairs": pairs, "any_flagged": any(p["flagged"] for p in pairs)}
+
     def _provenance_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = dict(self.run_info)
         out["noise_bucket_edges"] = self.config.noise_bucket_edges
@@ -1428,6 +1663,8 @@ class LossTracker:
                 sample["window_start"] = e.window_start
                 if e.window_interval is not None:
                     sample["window_interval"] = e.window_interval
+                if e.window_max_start is not None:
+                    sample["window_max_start"] = e.window_max_start
             samples.append(sample)
 
         record = {
@@ -1531,6 +1768,7 @@ class LossTracker:
             raw_ema = self._group_raw_emas_by_reg.get((g_key, reg))
             if raw_ema is not None and raw_ema._initialized:
                 row["ema_200_raw"] = round(raw_ema.value, 6)
+            self._attach_dropped(row, "group", g_key, reg)
             multiplier = self._group_multiplier_by_reg.get((g_key, reg))
             if multiplier is not None:
                 row["loss_multiplier"] = multiplier
@@ -1568,12 +1806,14 @@ class LossTracker:
             for (a_key, reg), ema in sorted(emas.items()):
                 if is_reg is not None and reg != is_reg:
                     continue
-                rows.append({
+                row = {
                     "type": row_type,
                     "name": self._sanitized_reverse.get(a_key, a_key),
                     "ema_200": round(ema.value, 6),
                     "sample_count": counts.get((a_key, reg), 0),
-                })
+                }
+                self._attach_dropped(row, row_type, a_key, reg)
+                rows.append(row)
         return rows
 
     def _matrix_snapshot(self, is_reg: Optional[bool]) -> list:
@@ -1601,6 +1841,15 @@ class LossTracker:
                 "name": self._sanitized_reverse.get(g_key, g_key),
                 "ema_200": round(ema.value, 6),
                 "sample_count": self._pres_group_sample_counts_by_reg.get((g_key, reg), 0),
+            })
+        for (p_key, reg), ema in sorted(self._pres_phase_emas_by_reg.items()):
+            if is_reg is not None and reg != is_reg:
+                continue
+            rows.append({
+                "type": "phase",
+                "name": self._sanitized_reverse.get(p_key, p_key),
+                "ema_200": round(ema.value, 6),
+                "sample_count": self._pres_phase_sample_counts_by_reg.get((p_key, reg), 0),
             })
         for (b_key, reg), ema in sorted(self._pres_bucket_emas_by_reg.items()):
             if is_reg is not None and reg != is_reg:
@@ -1711,6 +1960,9 @@ class LossTracker:
             # interleaving, and run provenance
             "exposure": self._exposure_snapshot(),
             "interleaving": self._interleaving_snapshot(),
+            "window_coverage": self._window_coverage_snapshot(),
+            "dropout": self._dropout_snapshot(),
+            "duplicates": self._duplicates_snapshot(),
             "provenance": self._provenance_dict(),
 
             # Sample totals
