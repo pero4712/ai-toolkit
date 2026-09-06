@@ -580,6 +580,10 @@ class ImageProcessingDTOMixin:
                     # Calculate max start frame to ensure we can get all num_frames
                     max_start_frame = max_frame_index - ((self.num_frames - 1) * frame_interval)
                     start_frame = random.randint(0, max(0, max_start_frame))
+                    # runtime sliding-window draw; the manifest cannot know this,
+                    # so it is surfaced to the loss tracker via the file item
+                    self.window_start = start_frame
+                    self.window_interval = frame_interval
                     
                     # Generate list of frames to extract
                     frames_to_extract = [start_frame + (i * frame_interval) for i in range(self.num_frames)]

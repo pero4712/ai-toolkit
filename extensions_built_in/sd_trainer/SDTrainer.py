@@ -1030,6 +1030,7 @@ class SDTrainer(BaseSDTrainProcess):
                     group_name = ds_cfg.dataset_name or os.path.basename(
                         ds_cfg.dataset_path or ds_cfg.folder_path or "unknown"
                     )
+                    attribution = self.loss_tracker.attribution_for(file_item, group_name)
                     prompt_i = _prompts[i] if i < len(_prompts) else ""
                     t_val = int(timesteps[i].item()) if i < len(timesteps) else int(timesteps[0].item())
                     self.loss_tracker.record_sample_loss(LossEvent(
@@ -1037,7 +1038,7 @@ class SDTrainer(BaseSDTrainProcess):
                         sample_idx=i,
                         loss_raw=loss_raw_list[i],
                         loss_final=loss_final_list[i],
-                        dataset_group=group_name,
+                        **attribution,
                         source_id=file_item.source_id,
                         source_path=file_item.path,
                         is_reg=file_item.is_reg,
@@ -2280,13 +2281,14 @@ class SDTrainer(BaseSDTrainProcess):
                                     group_name = ds_cfg.dataset_name or os.path.basename(
                                         ds_cfg.dataset_path or ds_cfg.folder_path or "unknown"
                                     )
+                                    attribution = self.loss_tracker.attribution_for(file_item, group_name)
                                     t_val = int(timesteps[i].item()) if i < len(timesteps) else int(timesteps[0].item())
                                     self.loss_tracker.record_sample_loss(LossEvent(
                                         step=self.step_num,
                                         sample_idx=i,
                                         loss_raw=pres_raw_list[i],
                                         loss_final=pres_raw_list[i] * multiplier,
-                                        dataset_group=group_name,
+                                        **attribution,
                                         source_id=file_item.source_id,
                                         source_path=file_item.path,
                                         is_reg=file_item.is_reg,

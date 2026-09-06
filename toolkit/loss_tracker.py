@@ -129,6 +129,21 @@ class LossEvent:
     # DOP/blank preservation loss events: aggregated in a separate metric
     # family so they never contaminate the normal-loss stats or video stats
     is_preservation: bool = False
+    # --- manifest attribution (toolkit/training_manifest.py); None when unjoined ---
+    folder_group: Optional[str] = None      # folder-derived name; dataset_group may be semantic
+    semantic_group: Optional[str] = None
+    phase_type: Optional[str] = None
+    phase_id: Optional[str] = None
+    level: Optional[str] = None
+    source_take: Optional[str] = None
+    segment_id: Optional[str] = None
+    duplicate_of: Optional[str] = None
+    clip_key: Optional[str] = None          # stable clip identity (base segment id); dups collapse
+    clip_name: Optional[str] = None         # display name for clip_key (base file stem)
+    is_manifest_joined: bool = False
+    # runtime sliding-window draw: the one signal only the trainer can log
+    window_start: Optional[int] = None
+    window_interval: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +186,7 @@ class VideoStats:
         "last_seen_step",
         "caption",
         "source_path",
+        "segment_id",
         "trend_means",
         "trend_steps",
         "was_outlier",
@@ -199,6 +215,8 @@ class VideoStats:
         self.caption: Optional[str] = None
         # media file path so the UI can play the clip from a worst-list row
         self.source_path: Optional[str] = None
+        # manifest segment id (stable across re-exports); None for unjoined clips
+        self.segment_id: Optional[str] = None
         self.trend_means: List[float] = []
         self.trend_steps: List[int] = []
         self.was_outlier: bool = False
@@ -332,6 +350,29 @@ class LossTracker:
         self._pres_matrix_emas_by_reg: Dict[Tuple[str, str, bool], EMAScalar] = {}
         self._has_preservation_data = False
 
+        # Manifest join (toolkit/training_manifest.ManifestIndex), set by the
+        # trainer once dataset configs are known. None -> folder attribution only.
+        self.manifest: Any = None
+        # Provenance echoed into the snapshot header and the first JSONL record
+        self.run_info: Dict[str, Any] = {}
+        self._jsonl_wrote_provenance = False
+        self.current_epoch: Optional[int] = None
+
+        # Manifest cohort axes: phase_type and level (only joined events carry them)
+        self._phase_emas_by_reg: Dict[Tuple[str, bool], EMAScalar] = {}
+        self._phase_sample_counts_by_reg: Dict[Tuple[str, bool], int] = defaultdict(int)
+        self._level_emas_by_reg: Dict[Tuple[str, bool], EMAScalar] = {}
+        self._level_sample_counts_by_reg: Dict[Tuple[str, bool], int] = defaultdict(int)
+
+        # Check 1: realized exposure per semantic group / source take (normal events)
+        self._exposure_group: Dict[str, Dict[str, int]] = {}
+        self._exposure_take: Dict[str, Dict[str, int]] = {}
+        self._exposure_total_draws = 0
+        self._exposure_joined_draws = 0
+
+        # Check 2: same-semantic-group adjacency per pooled folder per epoch
+        self._interleave: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
         # Whether any reg data has been seen
         self._has_reg_data = False
 
@@ -387,6 +428,48 @@ class LossTracker:
         return sanitized
 
     # -----------------------------------------------------------------------
+    # Manifest attribution
+    # -----------------------------------------------------------------------
+
+    def attribution_for(self, file_item: Any, folder_group: str) -> Dict[str, Any]:
+        """LossEvent attribution kwargs for a file item.
+
+        ``dataset_group`` becomes the manifest's semantic group when the file
+        joins (every existing group-keyed family turns semantic with no other
+        change); it stays the folder-derived name otherwise. ``folder_group``
+        always keeps the folder so folder-scoped checks still work.
+        """
+        fields: Dict[str, Any] = {
+            "dataset_group": folder_group,
+            "folder_group": folder_group,
+            "window_start": getattr(file_item, "window_start", None),
+            "window_interval": getattr(file_item, "window_interval", None),
+        }
+        manifest = self.manifest
+        if manifest is None:
+            return fields
+        try:
+            a = manifest.lookup(getattr(file_item, "path", None))
+        except Exception:
+            a = None
+        if a is None:
+            return fields
+        fields.update({
+            "dataset_group": a.semantic_group or folder_group,
+            "semantic_group": a.semantic_group or None,
+            "phase_type": a.phase_type or None,
+            "phase_id": a.phase_id or None,
+            "level": a.level or None,
+            "source_take": a.source_take or None,
+            "segment_id": a.segment_id or None,
+            "duplicate_of": a.duplicate_of or None,
+            "clip_key": a.base_segment_id or a.base_file or None,
+            "clip_name": a.clip_name or None,
+            "is_manifest_joined": True,
+        })
+        return fields
+
+    # -----------------------------------------------------------------------
     # Recording
     # -----------------------------------------------------------------------
 
@@ -401,7 +484,10 @@ class LossTracker:
         self,
         step: int,
         optimizer_stepped: bool = True,
+        epoch: Optional[int] = None,
     ) -> Dict[str, float]:
+        if epoch is not None:
+            self.current_epoch = epoch
         # Always update timing so step_time_ms stays meaningful
         now = time.time()
         step_time_ms = (now - self._last_commit_time) * 1000.0
@@ -493,6 +579,26 @@ class LossTracker:
                     metrics[f"loss_by_group_ema/{g_key}"] = self._group_emas_by_reg[key].value
                     metrics[f"samples_by_group/{g_key}"] = float(len(losses))
 
+            # Per-phase / per-level breakdown (manifest axes; only joined events carry them)
+            for attr, emas, counts, key_prefix in (
+                ("phase_type", self._phase_emas_by_reg, self._phase_sample_counts_by_reg, "loss_by_phase"),
+                ("level", self._level_emas_by_reg, self._level_sample_counts_by_reg, "loss_by_level"),
+            ):
+                axis_losses: Dict[str, List[float]] = defaultdict(list)
+                for e in split_events:
+                    val = getattr(e, attr)
+                    if val:
+                        axis_losses[val].append(e.loss_final)
+                for name, losses in axis_losses.items():
+                    a_key = self._get_sanitized_group(name)
+                    key = (a_key, is_reg)
+                    if key not in emas:
+                        emas[key] = EMAScalar(span=200)
+                    emas[key].update(sum(losses) / len(losses))
+                    counts[key] += len(losses)
+                    metric_key = f"{key_prefix}_reg_ema/{a_key}" if is_reg else f"{key_prefix}_ema/{a_key}"
+                    metrics[metric_key] = emas[key].value
+
             # Per-noise-bucket breakdown
             bucket_losses: Dict[str, List[float]] = defaultdict(list)
             for e in split_events:
@@ -564,6 +670,15 @@ class LossTracker:
                 f"loss_by_boundary_reg/{bidx}" if is_reg else f"loss_by_boundary/{bidx}"
             )
             metrics.setdefault(metric_key, ema.value)
+        for emas, key_prefix in (
+            (self._phase_emas_by_reg, "loss_by_phase"),
+            (self._level_emas_by_reg, "loss_by_level"),
+        ):
+            for (a_key, is_reg), ema in emas.items():
+                if not ema._initialized:
+                    continue
+                metric_key = f"{key_prefix}_reg_ema/{a_key}" if is_reg else f"{key_prefix}_ema/{a_key}"
+                metrics.setdefault(metric_key, ema.value)
 
         # Ratio metrics (only when both sides have data this step)
         concept_count = len(events_by_reg.get(False, []))
@@ -574,6 +689,9 @@ class LossTracker:
                 / max(self._reg_ema_200[False].value, 1e-10)
             )
             metrics["samples_ratio/reg_to_concept"] = float(reg_count) / float(concept_count)
+
+        # Manifest checks 1 and 2 (normal-loss draws, in draw order)
+        self._update_exposure_and_interleaving(events, self.current_epoch)
 
         # Preservation-loss aggregation (separate metric family)
         if pres_events:
@@ -678,8 +796,13 @@ class LossTracker:
 
     def _ensure_and_update(
         self, source_id: str, event: LossEvent, step: int,
+        display: Optional[str] = None, segment_id: Optional[str] = None,
     ) -> None:
-        """Create or update a VideoStats entry for *source_id*."""
+        """Create or update a VideoStats entry keyed by *source_id*.
+
+        *display* is the human-readable id shown in worst-lists (defaults to
+        the key); *segment_id* is the manifest's stable identity when known.
+        """
         vid_key = (source_id, event.is_reg)
         if vid_key not in self._video_stats:
             if len(self._video_stats) >= self.config.max_tracked_videos:
@@ -693,8 +816,9 @@ class LossTracker:
                 del self._video_stats[evict_key]
             g_key = self._get_sanitized_group(event.dataset_group)
             self._video_stats[vid_key] = VideoStats(
-                source_id, event.dataset_group, g_key, event.is_reg, window=50
+                display or source_id, event.dataset_group, g_key, event.is_reg, window=50
             )
+            self._video_stats[vid_key].segment_id = segment_id
         vs = self._video_stats[vid_key]
         vs.add(event.loss_final, event.loss_raw, step)
         if vs.caption is None and event.caption:
@@ -703,6 +827,20 @@ class LossTracker:
             vs.source_path = event.source_path
 
     def _update_video_stats(self, event: LossEvent, step: int) -> None:
+        if event.is_manifest_joined and event.clip_key:
+            # manifest identity: share copies collapse onto their base segment
+            # (via duplicate_of), and the per-take aggregate replaces the
+            # _windowN parent. Unjoined files below keep the suffix-regex path.
+            self._ensure_and_update(
+                event.clip_key, event, step,
+                display=event.clip_name or event.source_id,
+                segment_id=event.clip_key,
+            )
+            if event.source_take:
+                take_key = f"take:{event.source_take}"
+                self._ensure_and_update(take_key, event, step, display=take_key)
+            return
+
         norm_id = _normalize_source_id(event.source_id)
 
         # Per-clip entry (dups merge, windows stay separate)
@@ -830,6 +968,7 @@ class LossTracker:
             "loss_ratio": round(loss_ratio, 3),
             "caption": vs.caption,
             "source_path": vs.source_path,
+            "segment_id": vs.segment_id,
         }
 
     def get_worst_videos_extended(
@@ -1020,6 +1159,14 @@ class LossTracker:
             if reg != is_reg:
                 continue
             rows.append(["boundary", str(bidx), b_ema.value, self._boundary_sample_counts_by_reg.get((bidx, is_reg), 0)])
+        for row_type, emas, counts in (
+            ("phase", self._phase_emas_by_reg, self._phase_sample_counts_by_reg),
+            ("level", self._level_emas_by_reg, self._level_sample_counts_by_reg),
+        ):
+            for (a_key, reg), ema in sorted(emas.items()):
+                if reg != is_reg:
+                    continue
+                rows.append([row_type, self._sanitized_reverse.get(a_key, a_key), ema.value, counts.get((a_key, is_reg), 0)])
         return rows
 
     def log_summary_table(self, step: int, logger: Any) -> None:
@@ -1068,6 +1215,164 @@ class LossTracker:
                 pass
 
     # -----------------------------------------------------------------------
+    # Manifest checks: exposure (1), interleaving (2), provenance
+    # -----------------------------------------------------------------------
+
+    def _update_exposure_and_interleaving(self, events: List[LossEvent], epoch: Optional[int]) -> None:
+        """Bookkeeping for checks 1 and 2 over this step's normal-loss events."""
+        ep = epoch if epoch is not None else -1
+        for e in events:
+            self._exposure_total_draws += 1
+            if not e.is_manifest_joined:
+                continue
+            self._exposure_joined_draws += 1
+            if e.semantic_group:
+                g = self._exposure_group.setdefault(e.semantic_group, {"draws": 0, "reg_draws": 0})
+                g["draws"] += 1
+                if e.is_reg:
+                    g["reg_draws"] += 1
+            if e.source_take:
+                t = self._exposure_take.setdefault(e.source_take, {"draws": 0, "reg_draws": 0})
+                t["draws"] += 1
+                if e.is_reg:
+                    t["reg_draws"] += 1
+            # interleaving: same-semantic-group adjacency in a pooled folder's draw sequence
+            if e.semantic_group and e.folder_group:
+                key = (e.folder_group, ep)
+                st = self._interleave.get(key)
+                if st is None:
+                    st = {"last": None, "pairs": 0, "same": 0, "counts": defaultdict(int)}
+                    self._interleave[key] = st
+                    self._prune_interleave(e.folder_group)
+                if st["last"] is not None:
+                    st["pairs"] += 1
+                    if st["last"] == e.semantic_group:
+                        st["same"] += 1
+                st["last"] = e.semantic_group
+                st["counts"][e.semantic_group] += 1
+
+    def _prune_interleave(self, folder: str, keep: int = 20) -> None:
+        epochs = sorted(ep for (f, ep) in self._interleave if f == folder)
+        for ep in epochs[:-keep]:
+            self._interleave.pop((folder, ep), None)
+
+    @staticmethod
+    def _r4(x: Optional[float]) -> Optional[float]:
+        return None if x is None else round(x, 4)
+
+    def _exposure_snapshot(self) -> Dict[str, Any]:
+        """Check 1: realized draws per semantic group / source take vs design.
+
+        Expected share is the manifest's file share (duplicates count as
+        themselves: duplication IS the share system). The per-take view
+        collapses duplicate_of on the design side (distinct base files) but
+        counts every copy's draws, so a duplicated take shows its amplified
+        realized share. Groups from reg datasets carry reg_draws so their
+        lower draw rate (reg_every_n) can be read for what it is.
+        """
+        manifest = self.manifest
+        joined = self._exposure_joined_draws
+        total_files = getattr(manifest, "total_files", 0) if manifest is not None else 0
+        design_g = getattr(manifest, "design_by_group", {}) if manifest is not None else {}
+        design_t = getattr(manifest, "design_by_take", {}) if manifest is not None else {}
+        epoch = self.current_epoch
+
+        def ratio(realized: Optional[float], expected: Optional[float]) -> Optional[float]:
+            if realized is None or not expected:
+                return None
+            return round(realized / expected, 3)
+
+        by_group = []
+        for name in sorted(set(design_g) | set(self._exposure_group)):
+            files = design_g.get(name, {}).get("files", 0)
+            counts = self._exposure_group.get(name, {"draws": 0, "reg_draws": 0})
+            expected_share = files / total_files if total_files else None
+            realized_share = counts["draws"] / joined if joined else None
+            by_group.append({
+                "name": name,
+                "files": files,
+                "draws": counts["draws"],
+                "reg_draws": counts["reg_draws"],
+                "expected_share": self._r4(expected_share),
+                "realized_share": self._r4(realized_share),
+                "ratio": ratio(realized_share, expected_share),
+                "expected_draws": files * epoch if (epoch is not None and epoch > 0) else None,
+            })
+
+        total_copies = sum(d.get("copies", 0) for d in design_t.values())
+        by_take = []
+        for name in sorted(set(design_t) | set(self._exposure_take)):
+            design = design_t.get(name, {"files": 0, "copies": 0})
+            counts = self._exposure_take.get(name, {"draws": 0, "reg_draws": 0})
+            expected_share = design["copies"] / total_copies if total_copies else None
+            realized_share = counts["draws"] / joined if joined else None
+            by_take.append({
+                "name": name,
+                "files": design["files"],
+                "copies": design["copies"],
+                "draws": counts["draws"],
+                "reg_draws": counts["reg_draws"],
+                "expected_share": self._r4(expected_share),
+                "realized_share": self._r4(realized_share),
+                "ratio": ratio(realized_share, expected_share),
+            })
+
+        return {
+            "epoch": epoch,
+            "total_draws": self._exposure_total_draws,
+            "joined_draws": joined,
+            "unjoined_draws": self._exposure_total_draws - joined,
+            "manifest_files": total_files,
+            "by_semantic_group": by_group,
+            "by_source_take": by_take,
+        }
+
+    def _interleaving_snapshot(self) -> Dict[str, Any]:
+        """Check 2: same-semantic-group adjacency per pooled folder per epoch.
+
+        A shuffled baseline for the adjacency rate is sum(p_g^2) over the
+        folder's group proportions. A sequential folder walk over grouped
+        files reads as adjacency near 1.0 -- semantically clustered batches.
+        """
+        rows = []
+        for (folder, ep), st in sorted(self._interleave.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+            n = sum(st["counts"].values())
+            pairs = st["pairs"]
+            adjacency = st["same"] / pairs if pairs else None
+            baseline = sum((c / n) ** 2 for c in st["counts"].values()) if n else None
+            rt = (adjacency / baseline) if (adjacency is not None and baseline) else None
+            flagged = bool(
+                pairs >= 20
+                and adjacency is not None and baseline is not None
+                and adjacency - baseline > 0.1
+                and rt is not None and rt > 1.5
+            )
+            rows.append({
+                "folder": folder,
+                "epoch": ep if ep >= 0 else None,
+                "draws": n,
+                "groups": len(st["counts"]),
+                "adjacency_rate": self._r4(adjacency),
+                "baseline_rate": self._r4(baseline),
+                "ratio": round(rt, 3) if rt is not None else None,
+                "flagged": flagged,
+            })
+        return {
+            "epoch": self.current_epoch,
+            "by_folder": rows,
+            "any_flagged": any(r["flagged"] for r in rows),
+        }
+
+    def _provenance_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = dict(self.run_info)
+        out["noise_bucket_edges"] = self.config.noise_bucket_edges
+        try:
+            out["manifests"] = self.manifest.provenance() if self.manifest is not None else []
+        except Exception:
+            out["manifests"] = []
+        return out
+
+    # -----------------------------------------------------------------------
     # JSONL
     # -----------------------------------------------------------------------
 
@@ -1112,12 +1417,24 @@ class LossTracker:
             # keep the JSONL lean unless debug payloads are requested
             if self.config.debug and e.source_path:
                 sample["source_path"] = e.source_path
+            if e.is_manifest_joined:
+                for field in ("semantic_group", "phase_type", "level", "source_take", "segment_id"):
+                    val = getattr(e, field)
+                    if val:
+                        sample[field] = val
+                if e.folder_group and e.folder_group != e.dataset_group:
+                    sample["folder_group"] = e.folder_group
+            if e.window_start is not None:
+                sample["window_start"] = e.window_start
+                if e.window_interval is not None:
+                    sample["window_interval"] = e.window_interval
             samples.append(sample)
 
         record = {
             "run_id": self.run_id,
             "step": step,
             "step_type": "train",
+            "epoch": self.current_epoch,
             "optimizer_step": optimizer_stepped,
             "wall_time": time.time(),
             "lr": self.last_lr,
@@ -1134,6 +1451,12 @@ class LossTracker:
             "groups_n": len(groups),
             "samples": samples,
         }
+
+        if not self._jsonl_wrote_provenance:
+            # first record of the run echoes manifest hashes and the run's
+            # expert-boundary / timestep knobs for file-level ledger comparisons
+            record["provenance"] = self._provenance_dict()
+            self._jsonl_wrote_provenance = True
 
         line = json.dumps(record, ensure_ascii=False)
         self._jsonl_file.write(line + "\n")
@@ -1168,6 +1491,12 @@ class LossTracker:
         print(f"  Worst per group: {self.config.worst_per_group_n}")
         print(f"  Caption max len: {self.config.caption_max_len}")
         print(f"  Debug payloads: {'on' if self.config.debug else 'off'}")
+        if self.manifest is not None and getattr(self.manifest, "loaded", False):
+            print(
+                f"  Manifest: {self.manifest.total_files} rows from "
+                f"{len(self.manifest.provenance())} manifest(s); "
+                f"{len(self.manifest.design_by_group)} semantic groups"
+            )
         print()
 
     # -----------------------------------------------------------------------
@@ -1232,6 +1561,19 @@ class LossTracker:
                 "ema_200": round(b_ema.value, 6),
                 "sample_count": self._boundary_sample_counts_by_reg.get((bidx, reg), 0),
             })
+        for row_type, emas, counts in (
+            ("phase", self._phase_emas_by_reg, self._phase_sample_counts_by_reg),
+            ("level", self._level_emas_by_reg, self._level_sample_counts_by_reg),
+        ):
+            for (a_key, reg), ema in sorted(emas.items()):
+                if is_reg is not None and reg != is_reg:
+                    continue
+                rows.append({
+                    "type": row_type,
+                    "name": self._sanitized_reverse.get(a_key, a_key),
+                    "ema_200": round(ema.value, 6),
+                    "sample_count": counts.get((a_key, reg), 0),
+                })
         return rows
 
     def _matrix_snapshot(self, is_reg: Optional[bool]) -> list:
@@ -1364,6 +1706,12 @@ class LossTracker:
 
             # Group-level stats for external analysis
             "group_stats": self._group_stats_snapshot(),
+
+            # Manifest-driven diagnostics (P1): exposure vs design, draw
+            # interleaving, and run provenance
+            "exposure": self._exposure_snapshot(),
+            "interleaving": self._interleaving_snapshot(),
+            "provenance": self._provenance_dict(),
 
             # Sample totals
             "samples_total": samples_total,

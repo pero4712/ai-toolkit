@@ -189,6 +189,10 @@ class FileItemDTO(
         self.network_weight: float = self.dataset_config.network_weight
         self.is_reg = self.dataset_config.is_reg
         self._source_id: Optional[str] = None
+        # runtime sliding-window draw recorded at load time (None when frame
+        # selection is deterministic or the item is not a video)
+        self.window_start: Optional[int] = None
+        self.window_interval: Optional[int] = None
         self.prior_reg = self.dataset_config.prior_reg
         self.tensor: Union[torch.Tensor, None] = None
         self.audio_data = None

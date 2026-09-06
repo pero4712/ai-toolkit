@@ -198,6 +198,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
             dataset.cache_text_embeddings for dataset in self.dataset_configs
         )
 
+        # manifest join for loss attribution: Video LoRA Studio writes
+        # manifest.json beside the dataset folders of every training export
+        if getattr(self.loss_tracker, 'enabled', False):
+            try:
+                from toolkit.training_manifest import ManifestIndex
+                self.loss_tracker.manifest = ManifestIndex.load_for_folders(
+                    [d.folder_path or d.dataset_path for d in self.dataset_configs]
+                )
+            except Exception as e:
+                print_acc(f"Could not load training manifests: {e}")
+
         self.embed_config = None
         embedding_raw = self.get_conf('embedding', None)
         if embedding_raw is not None:
@@ -2620,6 +2631,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # control image) rather than failing at the first sample step
         self.validate_sample_config()
 
+        # run provenance echoed into loss_analysis.json and the first JSONL
+        # record: the config-verification items an audit otherwise has to check
+        if getattr(self.loss_tracker, 'enabled', False):
+            try:
+                is_multistage = bool(getattr(self.sd, 'is_multistage', False))
+                self.loss_tracker.run_info = {
+                    "job": self.job.name,
+                    "expert_boundaries": list(self.sd.multistage_boundaries) if is_multistage else None,
+                    "switch_boundary_every": getattr(self.train_config, 'switch_boundary_every', None),
+                    "timestep_type": self.train_config.timestep_type,
+                    "content_or_style": self.train_config.content_or_style,
+                    "num_train_timesteps": self.train_config.num_train_timesteps,
+                    "reg_every_n": getattr(self.train_config, 'reg_every_n', None),
+                    "diff_output_preservation": bool(getattr(self.train_config, 'diff_output_preservation', False)),
+                    "diff_output_preservation_multiplier": getattr(
+                        self.train_config, 'diff_output_preservation_multiplier', None
+                    ),
+                }
+            except Exception as e:
+                print_acc(f"Could not record run provenance: {e}")
+
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
             self.sample_safe(0, is_first=True)
@@ -2965,6 +2997,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     tracker_metrics = self.loss_tracker.commit_step(
                         self.step_num,
                         optimizer_stepped=not self.is_grad_accumulation_step,
+                        epoch=self.epoch_num,
                     )
                     if tracker_metrics:
                         self.logger.log(tracker_metrics)
