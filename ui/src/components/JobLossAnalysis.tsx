@@ -272,7 +272,7 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
   );
 
   const presNoiseRows = useMemo(
-    () => activePresSummary.filter(r => r.type === 'noise' || r.type === 'boundary'),
+    () => activePresSummary.filter(r => r.type === 'noise' || r.type === 'boundary' || r.type === 'phase'),
     [activePresSummary],
   );
 
@@ -300,6 +300,15 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
   const exportRef = useRef<HTMLDivElement>(null);
 
   const buildExportJson = useCallback(() => {
+    // boundaries as the trainer sees them: [1] + expert_boundaries (fractions of
+    // the 0..1000 timestep scale); expert i covers (b[i]*1000 .. b[i+1]*1000]
+    const expertRange = (i: number): [number, number] | null => {
+      const eb = data.provenance?.expert_boundaries;
+      if (!Array.isArray(eb) || !Number.isFinite(i) || i < 0 || i >= eb.length) return null;
+      const b = [1, ...eb.map(Number)];
+      return [Math.round(b[i] * 1000), Math.round(b[i + 1] * 1000)];
+    };
+
     const buildSection = (
       summary: SummaryRow[],
       matrix: MatrixCell[],
@@ -313,7 +322,9 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
       if (ema) section.ema = ema;
 
       const groups = summary.filter(r => r.type === 'group');
-      const noises = summary.filter(r => r.type === 'noise' || r.type === 'boundary');
+      const noises = summary.filter(r => r.type === 'noise');
+      const experts = summary.filter(r => r.type === 'boundary');
+      const cohorts = summary.filter(r => r.type === 'phase' || r.type === 'level');
 
       if (groups.length > 0) {
         section.group_summary = groups.map(r => ({
@@ -334,6 +345,28 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
           name: r.name,
           ema_200: r.ema_200,
           sample_count: r.sample_count,
+        }));
+      }
+      // expert split (multistage boundary index); previously mixed into
+      // noise_summary as type: "boundary" rows
+      if (experts.length > 0) {
+        section.expert_summary = experts.map(r => ({
+          expert_index: Number(r.name),
+          timestep_range: expertRange(Number(r.name)),
+          ema_200: r.ema_200,
+          sample_count: r.sample_count,
+          dropped_ema_200: r.dropped_ema_200 ?? null,
+        }));
+      }
+      // manifest cohort axes (phase_type / level)
+      if (cohorts.length > 0) {
+        section.cohort_summary = cohorts.map(r => ({
+          axis: r.type,
+          name: r.name,
+          ema_200: r.ema_200,
+          sample_count: r.sample_count,
+          dropped_ema_200: r.dropped_ema_200 ?? null,
+          dropped_samples: r.dropped_samples ?? null,
         }));
       }
 
@@ -380,18 +413,19 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
     const buildPresSection = (summary: SummaryRow[], matrix: MatrixCell[]) => {
       const section: Record<string, any> = {};
       const groups = summary.filter(r => r.type === 'group');
-      const noises = summary.filter(r => r.type === 'noise' || r.type === 'boundary');
-      if (groups.length > 0) {
-        section.by_group = groups.map(r => ({
-          name: r.name,
-          ema_200: r.ema_200,
-          sample_count: r.sample_count,
-        }));
-      }
-      if (noises.length > 0) {
-        section.by_noise = noises.map(r => ({
-          type: r.type,
-          name: r.name,
+      const phases = summary.filter(r => r.type === 'phase');
+      const noises = summary.filter(r => r.type === 'noise');
+      const experts = summary.filter(r => r.type === 'boundary');
+      const rowOf = (r: SummaryRow) => ({ name: r.name, ema_200: r.ema_200, sample_count: r.sample_count });
+      if (groups.length > 0) section.by_group = groups.map(rowOf);
+      if (phases.length > 0) section.by_phase = phases.map(rowOf);
+      if (noises.length > 0) section.by_noise = noises.map(r => ({ type: r.type, ...rowOf(r) }));
+      // expert split (multistage boundary index); previously mixed into
+      // by_noise as type: "boundary" rows
+      if (experts.length > 0) {
+        section.by_expert = experts.map(r => ({
+          expert_index: Number(r.name),
+          timestep_range: expertRange(Number(r.name)),
           ema_200: r.ema_200,
           sample_count: r.sample_count,
         }));
@@ -1006,7 +1040,7 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
             )}
             {presNoiseRows.length > 0 && (
               <div>
-                <p className="text-xs text-gray-500 mb-1">By Noise Bucket / Expert</p>
+                <p className="text-xs text-gray-500 mb-1">By Noise Bucket / Expert / Phase</p>
                 <UniversalTable
                   isLoading={status === 'loading'}
                   onRefresh={refresh}
@@ -1015,7 +1049,7 @@ export default function JobLossAnalysis({ job }: { job: Job }) {
                       title: 'Bucket',
                       key: 'name',
                       render: (row: any) =>
-                        row.type === 'boundary' ? `expert ${row.name}` : row.name,
+                        row.type === 'boundary' ? `expert ${row.name}` : row.type === 'phase' ? `phase: ${row.name}` : row.name,
                     },
                     {
                       title: 'Pres EMA-200',
