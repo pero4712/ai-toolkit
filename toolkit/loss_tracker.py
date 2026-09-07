@@ -354,6 +354,9 @@ class LossTracker:
         # Manifest join (toolkit/training_manifest.ManifestIndex), set by the
         # trainer once dataset configs are known. None -> folder attribution only.
         self.manifest: Any = None
+        # Check 1/2 load-time legs (manifest vs design = export bug), filled by
+        # evaluate_load_time_checks() at step 0 and echoed into every snapshot
+        self.load_time_checks: Dict[str, Any] = {"status": "not_evaluated"}
         # Provenance echoed into the snapshot header and the first JSONL record
         self.run_info: Dict[str, Any] = {}
         self._jsonl_wrote_provenance = False
@@ -444,6 +447,35 @@ class LossTracker:
     # -----------------------------------------------------------------------
     # Manifest attribution
     # -----------------------------------------------------------------------
+
+    def evaluate_load_time_checks(self, print_fn: Any = print) -> Dict[str, Any]:
+        """Run the manifest-vs-design checks at step 0, before any draw.
+
+        Red findings are EXPORT BUGS (the studio balanced or labeled the
+        wrong population) and are printed loudly; the full report lands in
+        ``loss_analysis.json`` under ``load_time_checks`` either way.
+        """
+        manifest = self.manifest
+        if manifest is None or not getattr(manifest, "loaded", False):
+            self.load_time_checks = {"status": "no_manifest", "findings": []}
+            return self.load_time_checks
+        try:
+            self.load_time_checks = manifest.load_time_checks()
+        except Exception as e:
+            self.load_time_checks = {"status": "error", "error": str(e), "findings": []}
+            return self.load_time_checks
+        findings = self.load_time_checks.get("findings") or []
+        if findings and print_fn is not None:
+            print_fn("=" * 70)
+            print_fn("[loss_tracker] RED: manifest vs design disagrees -- EXPORT BUG.")
+            print_fn("[loss_tracker] The dataset on disk is not the population the studio designed.")
+            for f in findings:
+                print_fn(f"[loss_tracker]   {f['check']}: {f['detail']}")
+            print_fn("=" * 70)
+        elif print_fn is not None and self.load_time_checks.get("design_source") == "manifest_fallback":
+            print_fn("[loss_tracker] manifest has no design_shares header; "
+                     "manifest is its own design (vs-design checks skipped)")
+        return self.load_time_checks
 
     def attribution_for(self, file_item: Any, folder_group: str) -> Dict[str, Any]:
         """LossEvent attribution kwargs for a file item.
@@ -1329,7 +1361,12 @@ class LossTracker:
         total_files = getattr(manifest, "total_files", 0) if manifest is not None else 0
         design_g = getattr(manifest, "design_by_group", {}) if manifest is not None else {}
         design_t = getattr(manifest, "design_by_take", {}) if manifest is not None else {}
+        design_shares = getattr(manifest, "design_shares", {}) if manifest is not None else {}
+        has_design = bool(getattr(manifest, "design_shares_present", False))
         epoch = self.current_epoch
+        # realized-vs-manifest is the LOADER DRIFT axis: end-of-epoch semantics,
+        # gated on at least one full pass worth of joined draws
+        drift_evaluated = bool(total_files and joined >= total_files)
 
         def ratio(realized: Optional[float], expected: Optional[float]) -> Optional[float]:
             if realized is None or not expected:
@@ -1342,6 +1379,11 @@ class LossTracker:
             counts = self._exposure_group.get(name, {"draws": 0, "reg_draws": 0})
             expected_share = files / total_files if total_files else None
             realized_share = counts["draws"] / joined if joined else None
+            rt = ratio(realized_share, expected_share)
+            drift = bool(
+                drift_evaluated and rt is not None
+                and (rt > 1.5 or rt < 1.0 / 1.5)
+            )
             by_group.append({
                 "name": name,
                 "files": files,
@@ -1349,7 +1391,9 @@ class LossTracker:
                 "reg_draws": counts["reg_draws"],
                 "expected_share": self._r4(expected_share),
                 "realized_share": self._r4(realized_share),
-                "ratio": ratio(realized_share, expected_share),
+                "design_share": self._r4(design_shares.get(name)) if has_design else None,
+                "ratio": rt,
+                "drift_flagged": drift,
                 "expected_draws": files * epoch if (epoch is not None and epoch > 0) else None,
             })
 
@@ -1377,6 +1421,10 @@ class LossTracker:
             "joined_draws": joined,
             "unjoined_draws": self._exposure_total_draws - joined,
             "manifest_files": total_files,
+            "design_source": ("design_shares" if has_design else
+                              ("manifest_fallback" if total_files else None)),
+            "drift_evaluated": drift_evaluated,
+            "any_drift_flagged": any(r["drift_flagged"] for r in by_group),
             "by_semantic_group": by_group,
             "by_source_take": by_take,
         }
@@ -1388,33 +1436,63 @@ class LossTracker:
         folder's group proportions. A sequential folder walk over grouped
         files reads as adjacency near 1.0 -- semantically clustered batches.
         """
+        manifest = self.manifest
+        groups_by_folder = getattr(manifest, "groups_by_folder", {}) if manifest is not None else {}
+        current_epoch = self.current_epoch
         rows = []
         for (folder, ep), st in sorted(self._interleave.items(), key=lambda kv: (kv[0][0], kv[0][1])):
             n = sum(st["counts"].values())
             pairs = st["pairs"]
-            adjacency = st["same"] / pairs if pairs else None
-            baseline = sum((c / n) ** 2 for c in st["counts"].values()) if n else None
-            rt = (adjacency / baseline) if (adjacency is not None and baseline) else None
-            flagged = bool(
-                pairs >= 20
-                and adjacency is not None and baseline is not None
-                and adjacency - baseline > 0.1
-                and rt is not None and rt > 1.5
-            )
-            rows.append({
+            manifest_groups = groups_by_folder.get(folder)
+            observed_groups = len(st["counts"])
+            row = {
                 "folder": folder,
                 "epoch": ep if ep >= 0 else None,
                 "draws": n,
-                "groups": len(st["counts"]),
-                "adjacency_rate": self._r4(adjacency),
-                "baseline_rate": self._r4(baseline),
-                "ratio": round(rt, 3) if rt is not None else None,
-                "flagged": flagged,
-            })
+                "groups": observed_groups,
+                "manifest_groups": len(manifest_groups) if manifest_groups is not None else None,
+            }
+            if manifest_groups is not None and len(manifest_groups) == 1:
+                # vacuity rule: adjacency over a 1-group folder is trivially
+                # perfect; it must never render as a passing score
+                row.update({
+                    "adjacency_rate": None,
+                    "baseline_rate": None,
+                    "ratio": None,
+                    "flagged": False,
+                    "note": "n/a (single-group folder)",
+                })
+            else:
+                adjacency = st["same"] / pairs if pairs else None
+                baseline = sum((c / n) ** 2 for c in st["counts"].values()) if n else None
+                rt = (adjacency / baseline) if (adjacency is not None and baseline) else None
+                row.update({
+                    "adjacency_rate": self._r4(adjacency),
+                    "baseline_rate": self._r4(baseline),
+                    "ratio": round(rt, 3) if rt is not None else None,
+                    "flagged": bool(
+                        pairs >= 20
+                        and adjacency is not None and baseline is not None
+                        and adjacency - baseline > 0.1
+                        and rt is not None and rt > 1.5
+                    ),
+                })
+            # check 2, epoch-end leg: sampler never reached some group's files
+            # (evaluated only for completed epochs; the current one is partial)
+            epoch_complete = bool(
+                ep >= 0 and current_epoch is not None and ep < current_epoch
+            )
+            if epoch_complete and manifest_groups and observed_groups < len(manifest_groups):
+                row["missing_groups"] = sorted(set(manifest_groups) - set(st["counts"]))
+                row["missing_groups_flagged"] = True
+            else:
+                row["missing_groups_flagged"] = False
+            rows.append(row)
         return {
-            "epoch": self.current_epoch,
+            "epoch": current_epoch,
             "by_folder": rows,
             "any_flagged": any(r["flagged"] for r in rows),
+            "any_missing_groups": any(r["missing_groups_flagged"] for r in rows),
         }
 
     # -- check 4 helpers ----------------------------------------------------
@@ -1958,6 +2036,7 @@ class LossTracker:
 
             # Manifest-driven diagnostics (P1): exposure vs design, draw
             # interleaving, and run provenance
+            "load_time_checks": self.load_time_checks,
             "exposure": self._exposure_snapshot(),
             "interleaving": self._interleaving_snapshot(),
             "window_coverage": self._window_coverage_snapshot(),

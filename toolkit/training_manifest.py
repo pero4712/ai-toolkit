@@ -72,6 +72,15 @@ class ManifestIndex:
         self.design_by_group: Dict[str, dict] = {}
         self.design_by_take: Dict[str, dict] = {}
         self.total_files: int = 0
+        # design_shares header: semantic group -> intended effective share (0-1),
+        # the exact numbers the studio's weight hierarchy computed at export.
+        # Older manifests lack the key; empty dict = fall back to file counts.
+        self.design_shares: Dict[str, float] = {}
+        self.design_shares_present: bool = False
+        # folder basename -> semantic groups / file counts, for the check-2
+        # cardinality tripwire (a pooled folder whose rows all claim one group)
+        self.groups_by_folder: Dict[str, List[str]] = {}
+        self.files_by_folder: Dict[str, int] = {}
 
     # ------------------------------------------------------------------ load
 
@@ -121,14 +130,26 @@ class ManifestIndex:
             "hash": hashlib.sha256(raw).hexdigest()[:12],
             "row_count": len(rows_by_file),
             "fps": data.get("fps"),
+            "design_shares": data.get("design_shares")
+            if isinstance(data.get("design_shares"), dict) else None,
         }
 
     def _build_design(self) -> None:
         by_group: Dict[str, int] = defaultdict(int)
         take_bases: Dict[str, set] = defaultdict(set)
         take_copies: Dict[str, int] = defaultdict(int)
+        folder_groups: Dict[str, set] = defaultdict(set)
+        folder_files: Dict[str, int] = defaultdict(int)
         total = 0
         for m in self._manifests.values():
+            shares = m.get("design_shares")
+            if shares:
+                self.design_shares_present = True
+                for g, v in shares.items():
+                    try:
+                        self.design_shares[str(g)] = float(v)
+                    except (TypeError, ValueError):
+                        pass
             for file_key, row in m["rows_by_file"].items():
                 total += 1
                 group = _s(row, "semantic_group")
@@ -139,10 +160,113 @@ class ManifestIndex:
                 if take:
                     take_copies[take] += 1
                     take_bases[take].add(_s(row, "duplicate_of") or file_key)
+                if "/" in file_key:
+                    folder = file_key.split("/", 1)[0]
+                    folder_files[folder] += 1
+                    if group:
+                        folder_groups[folder].add(group)
         self.total_files = total
         self.design_by_group = {g: {"files": n} for g, n in by_group.items()}
         self.design_by_take = {
             t: {"files": len(take_bases[t]), "copies": take_copies[t]} for t in take_copies
+        }
+        self.groups_by_folder = {f: sorted(gs) for f, gs in folder_groups.items()}
+        self.files_by_folder = dict(folder_files)
+
+    # ---------------------------------------------------- load-time checks
+
+    def load_time_checks(self, share_tolerance: float = 1.5) -> Dict[str, object]:
+        """Check 1 (manifest vs design) and check 2's load-time cardinality leg.
+
+        Evaluated at step 0, before a single draw. A red here is an EXPORT
+        BUG: the studio's share/attribution machinery balanced or labeled the
+        wrong population. Triggers: a design group with zero manifest rows, a
+        rows group absent from design, or a per-group file share off its
+        design share beyond *share_tolerance* relative. The cardinality leg:
+        a folder pooling many files under ONE manifest group while design
+        lists groups that have no rows anywhere.
+
+        Without a ``design_shares`` header (older manifests) the manifest is
+        its own design; the vs-design triggers cannot fire and the report
+        says so via ``design_source``.
+        """
+        if not self.loaded:
+            return {"status": "no_manifest", "design_source": None, "findings": []}
+        findings: List[dict] = []
+        rows_share = {
+            g: d["files"] / self.total_files
+            for g, d in self.design_by_group.items()
+        } if self.total_files else {}
+
+        design_source = "design_shares" if self.design_shares_present else "manifest_fallback"
+        if self.design_shares_present:
+            for g, share in sorted(self.design_shares.items()):
+                if g not in self.design_by_group:
+                    findings.append({
+                        "severity": "red",
+                        "check": "design_group_zero_rows",
+                        "detail": f"design group '{g}' (share {share:.3f}) has zero manifest rows",
+                    })
+            for g in sorted(self.design_by_group):
+                if g not in self.design_shares:
+                    findings.append({
+                        "severity": "red",
+                        "check": "rows_group_absent_from_design",
+                        "detail": f"manifest group '{g}' ({self.design_by_group[g]['files']} files) absent from design_shares",
+                    })
+            for g, share in sorted(self.design_shares.items()):
+                realized = rows_share.get(g)
+                if realized is None or share <= 0:
+                    continue
+                rel = realized / share if share else None
+                if rel is not None and (rel > share_tolerance or rel < 1.0 / share_tolerance):
+                    findings.append({
+                        "severity": "red",
+                        "check": "file_share_vs_design_share",
+                        "detail": (
+                            f"group '{g}': manifest file share {realized:.3f} vs design share "
+                            f"{share:.3f} ({rel:.2f}x, tolerance {share_tolerance}x)"
+                        ),
+                    })
+            # check 2, load-time leg: single-group pooled folder + orphaned design groups
+            orphaned = [g for g in self.design_shares if g not in self.design_by_group]
+            if orphaned:
+                for folder, groups in sorted(self.groups_by_folder.items()):
+                    files = self.files_by_folder.get(folder, 0)
+                    if files > 10 and len(groups) == 1:
+                        findings.append({
+                            "severity": "red",
+                            "check": "single_group_pooled_folder",
+                            "detail": (
+                                f"folder '{folder}' pools {files} files under one manifest group "
+                                f"'{groups[0]}' while design groups {orphaned} have no rows anywhere "
+                                "-- export-attribution shape"
+                            ),
+                        })
+
+        by_group = []
+        for g in sorted(set(self.design_shares) | set(self.design_by_group)):
+            by_group.append({
+                "name": g,
+                "files": self.design_by_group.get(g, {}).get("files", 0),
+                "manifest_share": round(rows_share[g], 4) if g in rows_share else None,
+                "design_share": round(self.design_shares[g], 4) if g in self.design_shares else None,
+            })
+        folders = [
+            {
+                "folder": f,
+                "files": self.files_by_folder.get(f, 0),
+                "manifest_groups": len(gs),
+                "groups": gs,
+            }
+            for f, gs in sorted(self.groups_by_folder.items())
+        ]
+        return {
+            "status": "red" if findings else "ok",
+            "design_source": design_source,
+            "findings": findings,
+            "by_group": by_group,
+            "folders": folders,
         }
 
     # ---------------------------------------------------------------- query

@@ -206,6 +206,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.loss_tracker.manifest = ManifestIndex.load_for_folders(
                     [d.folder_path or d.dataset_path for d in self.dataset_configs]
                 )
+                # check 1's manifest-vs-design leg is computable before a single
+                # draw; a red here is an export bug, surfaced at step 0
+                self.loss_tracker.evaluate_load_time_checks(print_fn=print_acc)
             except Exception as e:
                 print_acc(f"Could not load training manifests: {e}")
 
