@@ -191,6 +191,7 @@ class VideoStats:
         "trend_means",
         "trend_steps",
         "was_outlier",
+        "member_keys",
     )
 
     def __init__(
@@ -221,6 +222,9 @@ class VideoStats:
         self.trend_means: List[float] = []
         self.trend_steps: List[int] = []
         self.was_outlier: bool = False
+        # segment keys aggregated by take: rows; a take over one segment is a
+        # display twin of that segment's own row and gets suppressed
+        self.member_keys: set = set()
 
     def add(self, loss_final: float, loss_raw: float, step: int) -> None:
         if self.count >= len(self.losses):
@@ -880,6 +884,7 @@ class LossTracker:
     def _ensure_and_update(
         self, source_id: str, event: LossEvent, step: int,
         display: Optional[str] = None, segment_id: Optional[str] = None,
+        member_key: Optional[str] = None,
     ) -> None:
         """Create or update a VideoStats entry keyed by *source_id*.
 
@@ -904,6 +909,8 @@ class LossTracker:
             self._video_stats[vid_key].segment_id = segment_id
         vs = self._video_stats[vid_key]
         vs.add(event.loss_final, event.loss_raw, step)
+        if member_key:
+            vs.member_keys.add(member_key)
         if vs.caption is None and event.caption:
             vs.caption = " ".join(event.caption.split())
         if vs.source_path is None and event.source_path:
@@ -924,7 +931,10 @@ class LossTracker:
             )
             if event.source_take:
                 take_key = f"take:{event.source_take}"
-                self._ensure_and_update(take_key, event, step, display=take_key)
+                self._ensure_and_update(
+                    take_key, event, step, display=take_key,
+                    member_key=event.clip_key,
+                )
             return
 
         norm_id = _normalize_source_id(event.source_id)
@@ -936,6 +946,12 @@ class LossTracker:
         parent_id = _parent_source_id(event.source_id)
         if parent_id is not None and parent_id != norm_id:
             self._ensure_and_update(parent_id, event, step)
+
+    @staticmethod
+    def _is_redundant_take_row(v: VideoStats) -> bool:
+        """A take: aggregate over exactly one segment is a display twin of
+        that segment's own row (same stats, same count) and eats a list slot."""
+        return v.source_id.startswith("take:") and len(v.member_keys) <= 1
 
     def get_worst_videos(
         self, top_n: int = 20, is_reg: Optional[bool] = False,
@@ -959,6 +975,7 @@ class LossTracker:
             for v in self._video_stats.values()
             if v.total_count >= self.config.worst_min_count
             and (is_reg is None or v.is_reg == is_reg)
+            and not self._is_redundant_take_row(v)
         ]
         eligible.sort(key=lambda v: v.mean_raw, reverse=True)
         result = []
@@ -1069,6 +1086,7 @@ class LossTracker:
             v for v in self._video_stats.values()
             if v.total_count >= self.config.worst_min_count
             and (is_reg is None or v.is_reg == is_reg)
+            and not self._is_redundant_take_row(v)
         ]
         eligible.sort(key=lambda v: v.mean_raw, reverse=True)
         return [self._compute_clip_diagnostics(v) for v in eligible[:top_n]]
@@ -1087,6 +1105,7 @@ class LossTracker:
             v for v in self._video_stats.values()
             if v.total_count >= self.config.worst_min_count
             and (is_reg is None or v.is_reg == is_reg)
+            and not self._is_redundant_take_row(v)
         ]
 
         by_group: Dict[str, List[VideoStats]] = defaultdict(list)
@@ -1678,7 +1697,20 @@ class LossTracker:
 
     def _provenance_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = dict(self.run_info)
-        out["noise_bucket_edges"] = self.config.noise_bucket_edges
+        # echo the edges _bucket_timestep actually uses: the configured pair
+        # when valid, otherwise the thirds-of-schedule default it falls back to
+        edges = self.config.noise_bucket_edges
+        if edges is not None and len(edges) == 2 and edges[0] < edges[1]:
+            out["noise_bucket_edges"] = list(edges)
+            out["noise_bucket_edges_source"] = "configured"
+        else:
+            ntt = self.run_info.get("num_train_timesteps")
+            if ntt:
+                out["noise_bucket_edges"] = [ntt // 3, 2 * ntt // 3]
+                out["noise_bucket_edges_source"] = "auto_thirds"
+            else:
+                out["noise_bucket_edges"] = None
+                out["noise_bucket_edges_source"] = "auto_thirds_unresolved"
         try:
             out["manifests"] = self.manifest.provenance() if self.manifest is not None else []
         except Exception:
