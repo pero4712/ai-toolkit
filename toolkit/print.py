@@ -48,6 +48,8 @@ def setup_log_to_file(filename):
     # already-replaced sys.stdout as the stderr Logger's "terminal" would
     # double-write every stderr message to the file. Both wrappers share a
     # single file handle.
-    log_file = open(filename, 'a')
+    # explicit utf-8: the Windows default (cp1252) can't encode the loss
+    # tracker's trend arrows or non-Latin captions and kills the job
+    log_file = open(filename, 'a', encoding='utf-8', errors='replace')
     sys.stdout = Logger(sys.stdout, log_file)
     sys.stderr = Logger(sys.stderr, log_file)

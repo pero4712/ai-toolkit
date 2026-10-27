@@ -16,6 +16,15 @@ if "SEED" in os.environ:
 
 sys.path.insert(0, os.getcwd())
 
+# Redirected stdio on Windows (UI-launched jobs, `> log`) defaults to cp1252,
+# so a stray non-ASCII char in a print (trend arrows, captions) raises
+# UnicodeEncodeError and kills training. Force utf-8 and never fail on output.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 # The UI launches jobs with no console; keep anything we shell out to (torch
 # compiles, HF git downloads) from flashing a console window. Must come before
 # any import that might spawn a subprocess.
