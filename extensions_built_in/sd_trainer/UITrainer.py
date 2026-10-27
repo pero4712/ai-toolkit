@@ -221,7 +221,8 @@ class UITrainer(SDTrainer):
             # SIGINT (UI stop button or ctrl+c) is a stop, not an error
             self.is_stopping = True
             if self.accelerator.is_main_process:
-                self.update_status("stopped", "Job stopped")
+                # PausedAtStep carries "Paused at step N"
+                self.update_status("stopped", getattr(e, "status_info", "Job stopped"))
         elif self.accelerator.is_main_process and not self.is_stopping:
             self.update_status("error", str(e))
         self.update_db_key("step", self.last_save_step)

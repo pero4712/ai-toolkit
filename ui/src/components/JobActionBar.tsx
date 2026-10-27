@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
-import { Eye, Trash2, Pen, Play, Pause, Cog, X, Copy, Save, OctagonX, Image } from 'lucide-react';
+import { Eye, Trash2, Pen, Play, Pause, Cog, X, Copy, Save, OctagonX, Image, Square } from 'lucide-react';
 import { LuLoader } from 'react-icons/lu';
 import { Button } from '@headlessui/react';
 import { openConfirm } from '@/components/ConfirmModal';
@@ -8,6 +8,7 @@ import { Job } from '@prisma/client';
 import {
   startJob,
   stopJob,
+  pauseJob,
   deleteJob,
   getAvaliableJobActions,
   markJobAsStopped,
@@ -31,11 +32,13 @@ interface JobActionBarProps {
   menuAnchor?: 'bottom' | 'top end';
 }
 
-type PendingAction = 'start' | 'remove' | 'stop' | 'delete' | 'save' | 'sample' | 'markStopped';
+type PendingAction = 'start' | 'remove' | 'stop' | 'pause' | 'delete' | 'save' | 'sample' | 'markStopped';
 
 // If the job never reports a state change (e.g. the request silently failed
 // server-side), unlock the bar after this long so it can't stay stuck.
 const PENDING_TIMEOUT_MS = 30_000;
+// a pause waits for the current step to finish and a full save
+const PAUSE_PENDING_TIMEOUT_MS = 10 * 60_000;
 
 export default function JobActionBar({
   job,
@@ -73,7 +76,7 @@ export default function JobActionBar({
 
   useEffect(() => {
     if (!pending) return;
-    const timer = setTimeout(clearPending, PENDING_TIMEOUT_MS);
+    const timer = setTimeout(clearPending, pending === 'pause' ? PAUSE_PENDING_TIMEOUT_MS : PENDING_TIMEOUT_MS);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pending]);
@@ -99,7 +102,26 @@ export default function JobActionBar({
   const menuItemDisabledClass = `${menuItemClass} opacity-40 cursor-not-allowed`;
   const spinner = <LuLoader className={`${iconSizeClass} animate-spin`} />;
   const menuSpinner = <LuLoader className="w-4 h-4 animate-spin" />;
-  const menuPending = pending === 'save' || pending === 'sample' || pending === 'markStopped';
+  const isTrain = job.job_type === 'train';
+  const menuPending =
+    pending === 'save' || pending === 'sample' || pending === 'markStopped' || (isTrain && pending === 'stop');
+  const isResume = isTrain && job.step > 0;
+
+  // train jobs pause from the bar; a hard stop lives in the menu
+  const confirmStop = () =>
+    openConfirm({
+      title: isTrain ? 'Stop Job Now' : 'Stop Job',
+      message: isTrain
+        ? `Stop "${job.name}" immediately without saving? Resume continues from the last saved checkpoint (step ${job.step}); progress since then is lost. Use Pause to save first.`
+        : `Are you sure you want to stop the job "${job.name}"? You CAN resume later.`,
+      type: isTrain ? 'warning' : 'info',
+      confirmText: isTrain ? 'Stop Now' : 'Stop',
+      onConfirm: () =>
+        runAction('stop', async () => {
+          await stopJob(job.id);
+          if (onRefresh) onRefresh();
+        }),
+    });
 
   return (
     <div className={`flex items-center flex-shrink-0 ${className ?? ''}`}>
@@ -118,6 +140,7 @@ export default function JobActionBar({
             });
           }}
           className={actionButtonClass}
+          title={isResume ? `Resume from step ${job.step}` : 'Start'}
         >
           {pending === 'start' ? spinner : <Play className={iconSizeClass} />}
         </Button>
@@ -142,21 +165,31 @@ export default function JobActionBar({
           disabled={isBusy}
           onClick={() => {
             if (!canStop || isBusy) return;
+            if (!isTrain) {
+              confirmStop();
+              return;
+            }
             openConfirm({
-              title: 'Stop Job',
-              message: `Are you sure you want to stop the job "${job.name}"? You CAN resume later.`,
+              title: 'Pause Job',
+              message: `Pause "${job.name}"? It saves a checkpoint at the end of the current step, then stops and frees the GPU. Resume continues from that step.`,
               type: 'info',
-              confirmText: 'Stop',
+              confirmText: 'Pause',
               onConfirm: () =>
-                runAction('stop', async () => {
-                  await stopJob(job.id);
+                runAction('pause', async () => {
+                  try {
+                    await pauseJob(job.id);
+                  } catch (e: any) {
+                    if (e?.response?.data?.unsupported) confirmStop();
+                    throw e;
+                  }
                   if (onRefresh) onRefresh();
                 }),
             });
           }}
           className={actionButtonClass}
+          title={isTrain ? 'Pause (save, then stop)' : 'Stop'}
         >
-          {pending === 'stop' ? spinner : <Pause className={iconSizeClass} />}
+          {pending === 'pause' || (!isTrain && pending === 'stop') ? spinner : <Pause className={iconSizeClass} />}
         </Button>
       )}
       {!hideView && (
@@ -275,6 +308,20 @@ export default function JobActionBar({
               >
                 {pending === 'sample' ? menuSpinner : <Image className="w-4 h-4" />}
                 Sample Next Step
+              </div>
+            </MenuItem>
+          )}
+          {isTrain && canStop && (
+            <MenuItem disabled={isBusy}>
+              <div
+                className={isBusy ? menuItemDisabledClass : menuItemEnabledClass}
+                onClick={() => {
+                  if (isBusy) return;
+                  confirmStop();
+                }}
+              >
+                {pending === 'stop' ? menuSpinner : <Square className="w-4 h-4" />}
+                Stop Now (no save)
               </div>
             </MenuItem>
           )}

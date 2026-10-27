@@ -15,6 +15,7 @@ Layout written here (shared with ui/cron/jobState.ts):
     .export/request.json          {"id": ...}                    (UI -> trainer)
     .export/snapshot/done.json    {"id", "step", "files", ...}   (trainer -> UI)
     .export/snapshot_error.json   {"id", "error"}                (on failure)
+    .export/pause_request.json    {"id": ...}  save at step end, then stop (UI -> trainer)
 """
 
 import glob
@@ -33,6 +34,7 @@ SNAPSHOT_DIR = "snapshot"
 DONE_FILE = "done.json"
 ERROR_FILE = "snapshot_error.json"
 TRAINER_MARKER = "trainer.json"
+PAUSE_REQUEST_FILE = "pause_request.json"
 
 LOSS_DB = "loss_log.db"
 LOSS_EVENTS = "loss_events.jsonl"
@@ -45,19 +47,44 @@ def _export_dir(save_root: str) -> str:
     return os.path.join(save_root, EXPORT_DIR)
 
 
+class PausedAtStep(KeyboardInterrupt):
+    """Raised at a step end after saving for a pause request. A
+    KeyboardInterrupt so every trainer treats it as a normal stop."""
+
+    def __init__(self, step: int):
+        super().__init__(f"Paused at step {step}")
+        self.step = step
+        self.status_info = f"Paused at step {step}"
+
+
 def write_trainer_marker(save_root: str) -> None:
-    """Tell the UI this run answers export requests (older runs never would)."""
+    """Tell the UI this run answers export and pause requests (older runs never would)."""
     export_dir = _export_dir(save_root)
     os.makedirs(export_dir, exist_ok=True)
+    # a pause the previous run never answered must not stop this one at once
+    clear_pause_request(save_root)
     _write_json_atomic(
         os.path.join(export_dir, TRAINER_MARKER),
-        {"pid": os.getpid(), "started_at": time.time(), "snapshot_version": 1},
+        {"pid": os.getpid(), "started_at": time.time(), "snapshot_version": 1, "pause": True},
     )
 
 
 def read_request(save_root: str) -> Optional[dict]:
     """The pending export request, or None. Cheap enough to call every step."""
     return _read_request_file(save_root, REQUEST_FILE)
+
+
+def read_pause_request(save_root: str) -> Optional[dict]:
+    """The pending pause request, or None."""
+    return _read_request_file(save_root, PAUSE_REQUEST_FILE)
+
+
+def clear_pause_request(save_root: str) -> None:
+    try:
+        os.remove(os.path.join(_export_dir(save_root), PAUSE_REQUEST_FILE))
+    except OSError:
+        pass
+
 
 def _read_request_file(save_root: str, name: str) -> Optional[dict]:
     path = os.path.join(_export_dir(save_root), name)

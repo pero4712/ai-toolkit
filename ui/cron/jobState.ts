@@ -24,6 +24,8 @@ export const SNAPSHOT_DIR = 'snapshot';
 export const DONE_FILE = 'done.json';
 export const ERROR_FILE = 'snapshot_error.json';
 export const TRAINER_MARKER = 'trainer.json';
+// save at the next step end, then stop (the Pause button)
+export const PAUSE_REQUEST_FILE = 'pause_request.json';
 
 // archive folders for bundled training inputs
 export const ARCHIVE_DATASETS_DIR = 'datasets';

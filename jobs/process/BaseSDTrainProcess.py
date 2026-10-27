@@ -967,6 +967,37 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.progress_bar is not None:
                 self.progress_bar.unpause()
 
+    def maybe_pause(self):
+        """Answer a pending UI pause request: save at this step unless it was
+        just saved, then stop so the GPU is freed. Resume picks up here."""
+        from toolkit import job_state_snapshot
+
+        request = None
+        if self.accelerator.is_main_process:
+            request = job_state_snapshot.read_pause_request(self.save_root)
+        if self.accelerator.num_processes > 1:
+            from accelerate.utils import broadcast_object_list
+            holder = [request]
+            broadcast_object_list(holder)
+            request = holder[0]
+        if request is None:
+            return
+
+        if self.progress_bar is not None:
+            self.progress_bar.pause()
+        if self.last_save_step != self.step_num:
+            print_acc(f"\nSaving at step {self.step_num} to pause")
+            self.accelerator.wait_for_everyone()
+            self.save(self.step_num)
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            self.logger.flush()
+            if hasattr(self, 'loss_tracker') and self.loss_tracker.enabled:
+                self.loss_tracker.flush()
+            job_state_snapshot.clear_pause_request(self.save_root)
+        print_acc(f"Paused at step {self.step_num}")
+        raise job_state_snapshot.PausedAtStep(self.step_num)
+
     def _log_timing_metrics(self):
         """Log a curated timing breakdown from the step timer as metric keys.
 
@@ -3079,6 +3110,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # answer a UI "export state" request here, where no save or
                 # log write is in flight
                 self.maybe_export_snapshot()
+                self.maybe_pause()
 
                 #############################
                 # End of step

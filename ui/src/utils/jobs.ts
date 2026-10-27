@@ -34,6 +34,12 @@ export const stopJob = (jobID: string) => {
   });
 };
 
+// Save at the end of the current step, then stop. Rejects with the server's
+// response (409 + `unsupported` for a run started before pause existed).
+export const pauseJob = async (jobID: string) => {
+  await apiClient.post(`/api/jobs/${jobID}/pause`);
+};
+
 export const deleteJob = (jobID: string) => {
   return new Promise<void>((resolve, reject) => {
     apiClient
