@@ -14,12 +14,13 @@ export default function Dashboard() {
   const [importing, setImporting] = useState(false);
   const router = useRouter();
 
+  // raw body (not multipart) so the route can stream multi-GB bundles that
+  // carry datasets straight to disk
   const uploadState = async (file: File, overwrite: boolean) => {
-    const formData = new FormData();
-    formData.append('file', file);
-    if (overwrite) formData.append('overwrite', 'true');
-    return apiClient.post('/api/jobs/import_state', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
+    const params = new URLSearchParams({ filename: file.name });
+    if (overwrite) params.set('overwrite', 'true');
+    return apiClient.post(`/api/jobs/import_state?${params}`, file, {
+      headers: { 'Content-Type': 'application/zip' },
     });
   };
 

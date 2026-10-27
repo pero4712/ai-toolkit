@@ -1,127 +1,105 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
-import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
-import archiver from 'archiver';
+import crypto from 'crypto';
 import { getTrainingFolder } from '@/server/settings';
+import {
+  ExportStatus,
+  REQUEST_FILE,
+  TRAINER_MARKER,
+  exportDirOf,
+  readStatus,
+  writeJsonAtomic,
+  writeStatus,
+} from '../../../../../../cron/jobState';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// Auxiliary state files carried along with the checkpoint so a run can be
-// resumed on another machine with optimizer momentum and instrumentation
-// history intact.
-const AUX_FILES = ['optimizer.pt', 'config.yaml', 'loss_log.db', 'loss_events.jsonl', 'loss_analysis.json'];
+// the job's folder is written by its trainer in these states, so the trainer
+// takes the snapshot (cron/jobState.ts describes the flow)
+const RUNNING_STATES = ['running', 'stopping'];
 
-type PostBody = {
-  // include every checkpoint instead of only the latest one
-  allCheckpoints?: boolean;
-};
+const isPending = (s: ExportStatus | null) => s?.state === 'requested' || s?.state === 'zipping';
 
+async function jobFolderFor(jobID: string) {
+  const job = await prisma.job.findUnique({ where: { id: jobID } });
+  if (!job) return null;
+  return { job, jobFolder: path.join(await getTrainingFolder(), job.name) };
+}
+
+/** Current export status of the job ({state: 'none'} if never exported). */
+export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
+  const { jobID } = await params;
+  const found = await jobFolderFor(jobID);
+  if (!found) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+  return NextResponse.json((await readStatus(found.jobFolder)) ?? { state: 'none' });
+}
+
+/**
+ * Request a state export. Returns at once; the worker builds the zip
+ * (via the trainer's snapshot if the job is running, saving at its current
+ * step) and the zip then shows up in the job's file list.
+ */
 export async function POST(request: NextRequest, { params }: { params: { jobID: string } }) {
   const { jobID } = await params;
+  const found = await jobFolderFor(jobID);
+  if (!found) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+  const { job, jobFolder } = found;
 
-  const job = await prisma.job.findUnique({ where: { id: jobID } });
-  if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+  const current = await readStatus(jobFolder);
+  if (isPending(current)) return NextResponse.json(current);
 
-  let body: PostBody = {};
-  try {
-    body = (await request.json()) as PostBody;
-  } catch {
-    // empty body is fine
-  }
-
-  const trainingFolder = await getTrainingFolder();
-  const jobFolder = path.join(trainingFolder, job.name);
-
-  let entries: fs.Dirent[];
-  try {
-    entries = await fsp.readdir(jobFolder, { withFileTypes: true });
-  } catch {
-    return NextResponse.json({ error: 'Job folder not found' }, { status: 404 });
-  }
-
-  // checkpoints live flat in the job folder; pick by modification time so the
-  // exported optimizer.pt (always from the latest save) matches the checkpoint
-  const checkpoints: { name: string; mtimeMs: number }[] = [];
-  for (const entry of entries) {
-    if (entry.isFile() && entry.name.endsWith('.safetensors')) {
-      const stat = await fsp.stat(path.join(jobFolder, entry.name));
-      checkpoints.push({ name: entry.name, mtimeMs: stat.mtimeMs });
-    }
-  }
-  checkpoints.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-  if (checkpoints.length === 0) {
-    return NextResponse.json({ error: 'No checkpoints to export yet' }, { status: 404 });
-  }
-
-  const includedCheckpoints = body.allCheckpoints ? checkpoints : checkpoints.slice(0, 1);
-
-  const includedAux: string[] = [];
-  for (const aux of AUX_FILES) {
+  const viaTrainer = RUNNING_STATES.includes(job.status);
+  const exportDir = exportDirOf(jobFolder);
+  if (viaTrainer) {
     try {
-      const stat = await fsp.stat(path.join(jobFolder, aux));
-      if (stat.isFile()) includedAux.push(aux);
+      await fsp.access(path.join(exportDir, TRAINER_MARKER));
     } catch {
-      // not present, skip
+      return NextResponse.json(
+        {
+          error:
+            'This run was started before live state export was supported. Stop the job to export its latest checkpoint, or restart it to export while training.',
+        },
+        { status: 409 },
+      );
     }
+  } else {
+    let hasCheckpoint = false;
+    try {
+      hasCheckpoint = (await fsp.readdir(jobFolder)).some(f => f.endsWith('.safetensors'));
+    } catch {
+      // no folder yet
+    }
+    if (!hasCheckpoint) return NextResponse.json({ error: 'No checkpoints to export yet' }, { status: 404 });
   }
 
-  let jobConfig: any = null;
-  try {
-    jobConfig = JSON.parse(job.job_config);
-  } catch {
-    return NextResponse.json({ error: 'Job config is not valid JSON' }, { status: 500 });
-  }
-
-  const state = {
-    format: 'aitk_job_state',
-    version: 1,
-    exported_at: new Date().toISOString(),
-    name: job.name,
-    gpu_ids: job.gpu_ids,
-    job_type: job.job_type,
-    job_ref: job.job_ref,
-    step: job.step,
-    job_config: jobConfig,
-    files: [...includedCheckpoints.map(c => c.name), ...includedAux],
+  const now = Date.now() / 1000;
+  const status: ExportStatus = {
+    id: crypto.randomUUID(),
+    state: 'requested',
+    requested_at: now,
+    updated_at: now,
+    via_trainer: viaTrainer,
   };
+  // request first: once status says requested, the worker may look for it
+  if (viaTrainer) await writeJsonAtomic(path.join(exportDir, REQUEST_FILE), { id: status.id });
+  await writeStatus(jobFolder, status);
+  return NextResponse.json(status, { status: 202 });
+}
 
-  const exportDir = path.join(jobFolder, '.export');
-  await fsp.mkdir(exportDir, { recursive: true });
-  const fileName = `${job.name}_state_step${job.step}.zip`;
-  const outputPath = path.join(exportDir, fileName);
-  await fsp.rm(outputPath, { force: true });
+/** Cancel an export still waiting for its snapshot. */
+export async function DELETE(request: NextRequest, { params }: { params: { jobID: string } }) {
+  const { jobID } = await params;
+  const found = await jobFolderFor(jobID);
+  if (!found) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
 
-  await new Promise<void>((resolve, reject) => {
-    const output = fs.createWriteStream(outputPath);
-    // checkpoints are already-compressed tensors; store instead of deflate
-    // keeps export fast and barely larger
-    const archive = archiver('zip', { zlib: { level: 1 } });
-
-    output.on('close', () => resolve());
-    output.on('error', reject);
-    archive.on('error', reject);
-
-    archive.pipe(output);
-    archive.append(JSON.stringify(state, null, 2), { name: 'job_state.json' });
-    for (const c of includedCheckpoints) {
-      archive.file(path.join(jobFolder, c.name), { name: c.name });
-    }
-    for (const aux of includedAux) {
-      archive.file(path.join(jobFolder, aux), { name: aux });
-    }
-
-    archive.finalize().catch(reject);
-  });
-
-  return NextResponse.json({
-    ok: true,
-    zipPath: outputPath,
-    fileName,
-    checkpoints: includedCheckpoints.map(c => c.name),
-    aux: includedAux,
-  });
+  const current = await readStatus(found.jobFolder);
+  if (current?.state !== 'requested') {
+    return NextResponse.json({ error: 'Only an export still waiting for its snapshot can be cancelled' }, { status: 409 });
+  }
+  await fsp.rm(path.join(exportDirOf(found.jobFolder), REQUEST_FILE), { force: true });
+  await writeStatus(found.jobFolder, { ...current, state: 'cancelled' });
+  return NextResponse.json({ ok: true });
 }

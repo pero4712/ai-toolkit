@@ -916,6 +916,57 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def hook_after_sd_init_before_load(self):
         pass
 
+    def maybe_export_snapshot(self):
+        """Answer a pending UI export request (toolkit/job_state_snapshot.py).
+
+        Saves a checkpoint at the current step unless this step was just
+        saved, then freezes the job state into .export/snapshot/ for the UI to
+        zip. Failures are reported to the UI and never stop training.
+        """
+        from toolkit import job_state_snapshot
+
+        request = None
+        if self.accelerator.is_main_process:
+            request = job_state_snapshot.read_request(self.save_root)
+        if self.accelerator.num_processes > 1:
+            # every rank must agree, since save() is collective
+            from accelerate.utils import broadcast_object_list
+            holder = [request]
+            broadcast_object_list(holder)
+            request = holder[0]
+        if request is None:
+            return
+
+        if self.progress_bar is not None:
+            self.progress_bar.pause()
+        try:
+            if self.last_save_step != self.step_num:
+                print_acc(f"\nSaving at step {self.step_num} for state export")
+                self.accelerator.wait_for_everyone()
+                self.save(self.step_num)
+                self.ensure_params_requires_grad()
+                flush()
+            self.accelerator.wait_for_everyone()
+            if self.accelerator.is_main_process:
+                # buffered loss rows and events up to this step must be on disk
+                self.logger.flush()
+                if hasattr(self, 'loss_tracker') and self.loss_tracker.enabled:
+                    self.loss_tracker.flush()
+                done = job_state_snapshot.build_snapshot(
+                    self.save_root,
+                    self.step_num,
+                    request,
+                    loss_db_path=getattr(self.logger, 'log_file', None),
+                )
+                print_acc(f"State snapshot for export ready at step {done['step']}")
+        except Exception as e:
+            print_acc(f"State export snapshot failed: {e}")
+            if self.accelerator.is_main_process:
+                job_state_snapshot.report_error(self.save_root, request, str(e))
+        finally:
+            if self.progress_bar is not None:
+                self.progress_bar.unpause()
+
     def _log_timing_metrics(self):
         """Log a curated timing breakdown from the step timer as metric keys.
 
@@ -2729,6 +2780,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
 
         start_step_num = self.step_num
+        if self.accelerator.is_main_process:
+            # lets the UI export this run's state live (maybe_export_snapshot)
+            from toolkit import job_state_snapshot
+            job_state_snapshot.write_trainer_marker(self.save_root)
         did_first_flush = False
         flush_next = False
         for step in range(start_step_num, self.train_config.steps):
@@ -3020,6 +3075,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # sets progress bar to match our step (step is complete, so completed count is step + 1)
                 if self.progress_bar is not None:
                     self.progress_bar.update(step + 1 - self.progress_bar.n)
+
+                # answer a UI "export state" request here, where no save or
+                # log write is in flight
+                self.maybe_export_snapshot()
 
                 #############################
                 # End of step

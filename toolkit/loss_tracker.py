@@ -2096,6 +2096,10 @@ class LossTracker:
     # Cleanup
     # -----------------------------------------------------------------------
 
+    def flush(self) -> None:
+        if self._jsonl_file is not None:
+            self._jsonl_file.flush()
+
     def close(self) -> None:
         if self._jsonl_file is not None:
             self._jsonl_file.flush()

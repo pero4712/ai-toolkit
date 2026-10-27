@@ -1,4 +1,5 @@
 import processQueue from './actions/processQueue';
+import processExports from './actions/processExports';
 import prisma from './prisma';
 
 // Journal mode for the main sqlite db. WAL keeps readers from blocking while
@@ -63,6 +64,12 @@ class CronWorker {
   }
 
   async loop() {
+    // caught here so an export error never keeps the queue from running
+    try {
+      await processExports();
+    } catch (error) {
+      console.error('Error processing state exports:', error);
+    }
     await processQueue();
   }
 }

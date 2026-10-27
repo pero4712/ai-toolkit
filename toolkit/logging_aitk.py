@@ -30,9 +30,33 @@ class EmptyLogger:
     def log_image(self, *args, **kwargs):
         pass
 
+    # write any buffered rows now
+    def flush(self):
+        pass
+
     # finish logging
     def finish(self):
         pass
+
+
+def prune_steps_after(con: sqlite3.Connection, step: int) -> None:
+    """Drop loss-log rows past ``step`` (UILogger schema)."""
+    con.execute("PRAGMA foreign_keys=ON;")
+    con.execute("BEGIN;")
+    # metrics rows cascade via FK ON DELETE CASCADE
+    con.execute("DELETE FROM steps WHERE step > ?;", (step,))
+    # drop any keys that no longer have any metrics, and clamp last_seen_step
+    con.execute(
+        "DELETE FROM metric_keys "
+        "WHERE NOT EXISTS (SELECT 1 FROM metrics WHERE metrics.key = metric_keys.key);"
+    )
+    con.execute(
+        "UPDATE metric_keys "
+        "SET last_seen_step = (SELECT MAX(step) FROM metrics WHERE metrics.key = metric_keys.key) "
+        "WHERE last_seen_step > ?;",
+        (step,),
+    )
+    con.execute("COMMIT;")
 
 
 # Wandb logger class
@@ -198,6 +222,10 @@ class UILogger:
         # this doesnt log images for now
         pass
 
+    def flush(self):
+        if self._started:
+            self._flush()
+
     # finish logging
     def finish(self):
         if not self._started:
@@ -263,23 +291,7 @@ class UILogger:
 
     def _prune_future_steps(self, current_step: int) -> None:
         assert self._con is not None
-        con = self._con
-
-        con.execute("BEGIN;")
-        # metrics rows cascade via FK ON DELETE CASCADE
-        con.execute("DELETE FROM steps WHERE step > ?;", (current_step,))
-        # drop any keys that no longer have any metrics, and clamp last_seen_step
-        con.execute(
-            "DELETE FROM metric_keys "
-            "WHERE NOT EXISTS (SELECT 1 FROM metrics WHERE metrics.key = metric_keys.key);"
-        )
-        con.execute(
-            "UPDATE metric_keys "
-            "SET last_seen_step = (SELECT MAX(step) FROM metrics WHERE metrics.key = metric_keys.key) "
-            "WHERE last_seen_step > ?;",
-            (current_step,),
-        )
-        con.execute("COMMIT;")
+        prune_steps_after(self._con, current_step)
 
     def _flush(self) -> None:
         if not self._pending_steps and not self._pending_metrics:

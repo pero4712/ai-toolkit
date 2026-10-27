@@ -57,5 +57,19 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     // no optimizer state present, skip it
   }
 
+  // finished state exports (the worker renames a .partial into place, so
+  // only complete zips match)
+  const exportDir = path.join(jobFolder, '.export');
+  try {
+    for (const file of await fs.promises.readdir(exportDir)) {
+      if (!/_state_step\d+\.zip$/.test(file)) continue;
+      const filePath = path.join(exportDir, file);
+      const stats = await fs.promises.stat(filePath);
+      fileObjects.push({ path: filePath, size: stats.size });
+    }
+  } catch {
+    // nothing exported yet
+  }
+
   return NextResponse.json({ files: fileObjects });
 }
