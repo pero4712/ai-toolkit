@@ -1393,10 +1393,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # get our current sample range
                     boundaries = [1] + self.sd.multistage_boundaries
                     boundary_max, boundary_min = boundaries[self.current_boundary_index], boundaries[self.current_boundary_index + 1]
+                    # select boundary_min < t <= boundary_max, matching the
+                    # multistage router (t > boundary -> earlier expert). lo/hi
+                    # count timesteps above each edge; on off-grid boundaries
+                    # (sigmoid/shift schedules) a ">=" edge would hand this
+                    # stage a timestep the router sends to the previous expert
                     asc_timesteps = torch.flip(self.sd.noise_scheduler.timesteps, dims=[0])
-                    lo = len(asc_timesteps) - torch.searchsorted(asc_timesteps, torch.tensor(boundary_max * 1000, device=asc_timesteps.device), right=False)
+                    lo = len(asc_timesteps) - torch.searchsorted(asc_timesteps, torch.tensor(boundary_max * 1000, device=asc_timesteps.device), right=True)
                     hi = len(asc_timesteps) - torch.searchsorted(asc_timesteps, torch.tensor(boundary_min * 1000, device=asc_timesteps.device), right=True)
-                    first_idx = (lo - 1).item() if hi > lo else 0
+                    first_idx = lo.item() if hi > lo else 0
                     last_idx  = (hi - 1).item() if hi > lo else 999
                     min_noise_steps = first_idx
                     max_noise_steps = last_idx
