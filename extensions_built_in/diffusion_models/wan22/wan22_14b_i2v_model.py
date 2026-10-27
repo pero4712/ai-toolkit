@@ -12,10 +12,12 @@ from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 from diffusers import WanImageToVideoPipeline
 from torchvision.transforms import functional as TF
 
-from .wan22_14b_model import Wan2214bModel
+from .wan22_14b_model import Wan2214bModel, boundary_ratio_i2v
 
 class Wan2214bI2VModel(Wan2214bModel):
     arch = "wan22_14b_i2v"
+    # Wan 2.2 I2V hands off between experts at t=900, not t2v's 875
+    boundary_ratio = boundary_ratio_i2v
     # samples must carry a first frame; without one the conditioning channels
     # are absent and the transformer input is malformed
     requires_sample_ctrl_img = True

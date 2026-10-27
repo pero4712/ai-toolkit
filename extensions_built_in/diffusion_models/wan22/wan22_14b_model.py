@@ -175,6 +175,10 @@ class Wan2214bModel(Wan21):
     _wan_generation_scheduler_config = scheduler_configUniPC
     _wan_expand_timesteps = False
     _wan_vae_path = "ai-toolkit/wan2.1-vae"
+    # high/low-noise expert split as a fraction of 1000 timesteps. One value
+    # drives training timestep ranges, forward routing and sampling, so they
+    # can't disagree. Subclasses override (i2v uses 0.9).
+    boundary_ratio: float = boundary_ratio_t2v
 
     def __init__(
         self,
@@ -199,8 +203,9 @@ class Wan2214bModel(Wan21):
 
         self.is_multistage = True
         # multistage boundaries split the models up when sampling timesteps
-        # for wan 2.2 14b. the timesteps are 1000-875 for transformer 1 and 875-0 for transformer 2
-        self.multistage_boundaries: List[float] = [0.875, 0.0]
+        # for wan 2.2 14b. transformer 1 takes 1000 down to the boundary
+        # (875 t2v, 900 i2v) and transformer 2 the boundary down to 0
+        self.multistage_boundaries: List[float] = [self.boundary_ratio, 0.0]
 
         self.train_high_noise = model_config.model_kwargs.get("train_high_noise", True)
         self.train_low_noise = model_config.model_kwargs.get("train_low_noise", True)
@@ -377,7 +382,7 @@ class Wan2214bModel(Wan21):
             transformer_2=transformer_2,
             torch_dtype=self.torch_dtype,
             device=self.device_torch,
-            boundary_ratio=boundary_ratio_t2v,
+            boundary_ratio=self.boundary_ratio,
             low_vram=self.model_config.low_vram,
         )
         
@@ -418,8 +423,7 @@ class Wan2214bModel(Wan21):
             expand_timesteps=self._wan_expand_timesteps,
             device=self.device_torch,
             aggressive_offload=self.model_config.low_vram,
-            # todo detect if it is i2v or t2v
-            boundary_ratio=boundary_ratio_t2v,
+            boundary_ratio=self.boundary_ratio,
         )
 
         # pipeline = pipeline.to(self.device_torch)
