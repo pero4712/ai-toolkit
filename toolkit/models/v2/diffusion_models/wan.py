@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as DiffusersWanTransformer3DModel
@@ -118,6 +120,42 @@ class WanTransformer3DModel(DiffusersWanTransformer3DModel, OstrisModelMixin):
     # non-quantized tensors to the load dtype (the old holder did this with a
     # blanket .to(device, dtype) after load)
     aitk_cast_quantized_load = True
+
+    @classmethod
+    def resolve_comfy_weights(
+        cls,
+        name_or_path,
+        subfolder=None,
+        local_only=False,
+        hf_token=None,
+        status_fn=None,
+        qtype=None,
+    ):
+        # the wan2.2 A14B comfy files only ship as fp8_scaled. Swap them in
+        # only when the run quantizes to fp8 anyway; otherwise load the
+        # standard repo's bf16 weights, so a full-precision run (or one
+        # resumed from before the comfy swap) doesn't train on a lossier base
+        candidates = None
+        if subfolder is not None:
+            candidates = cls.aitk_comfy_weight_names.get((name_or_path, subfolder))
+        if candidates is None:
+            candidates = cls.aitk_comfy_weight_names.get(name_or_path)
+        if isinstance(candidates, dict):
+            candidates = candidates.get("files")
+        if (
+            candidates
+            and "float8" not in (qtype or "").lower()
+            and all("fp8" in os.path.basename(c).lower() for c in candidates)
+        ):
+            return None
+        return super().resolve_comfy_weights(
+            name_or_path,
+            subfolder=subfolder,
+            local_only=local_only,
+            hf_token=hf_token,
+            status_fn=status_fn,
+            qtype=qtype,
+        )
 
     @classmethod
     def get_transformer_block_names(cls):
