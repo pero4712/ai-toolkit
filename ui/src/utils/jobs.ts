@@ -34,10 +34,16 @@ export const stopJob = (jobID: string) => {
   });
 };
 
-// Save at the end of the current step, then stop. Rejects with the server's
-// response (409 + `unsupported` for a run started before pause existed).
+// Save at the end of the current step, then stop.
 export const pauseJob = async (jobID: string) => {
   await apiClient.post(`/api/jobs/${jobID}/pause`);
+};
+
+// Whether the job's current run answers pause requests (runs started
+// before pause existed don't).
+export const getPauseSupported = async (jobID: string) => {
+  const res = await apiClient.get(`/api/jobs/${jobID}/pause`);
+  return res.data?.supported === true;
 };
 
 export const deleteJob = (jobID: string) => {

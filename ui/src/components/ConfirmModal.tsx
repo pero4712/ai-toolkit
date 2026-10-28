@@ -30,6 +30,8 @@ export default function ConfirmModal() {
   const [isOpen, setIsOpen] = useState(false);
   const [inputValue, setInputValue] = useState<string>('');
   const inputRef = useRef<HTMLInputElement>(null);
+  const confirmRef = useRef(confirm);
+  confirmRef.current = confirm;
 
   useFromNull(() => {
     setTimeout(() => {
@@ -48,9 +50,11 @@ export default function ConfirmModal() {
 
   useEffect(() => {
     if (!isOpen) {
-      // use timeout to allow the dialog to close before resetting the state
+      // use timeout to allow the dialog to close before resetting the state,
+      // but keep a dialog opened meanwhile (e.g. from the closing one's onConfirm)
+      const closing = confirmRef.current;
       setTimeout(() => {
-        setConfirm(null);
+        if (confirmRef.current === closing) setConfirm(null);
       }, 500);
     }
   }, [isOpen]);

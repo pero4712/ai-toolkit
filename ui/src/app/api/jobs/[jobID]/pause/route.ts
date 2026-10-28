@@ -9,6 +9,25 @@ import { PAUSE_REQUEST_FILE, TRAINER_MARKER, exportDirOf, writeJsonAtomic } from
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+async function pauseSupported(exportDir: string) {
+  try {
+    const marker = JSON.parse(await fsp.readFile(path.join(exportDir, TRAINER_MARKER), 'utf-8'));
+    return marker?.pause === true;
+  } catch {
+    // run predates the marker
+    return false;
+  }
+}
+
+/** Whether the job's current run answers pause requests. */
+export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
+  const { jobID } = await params;
+  const job = await prisma.job.findUnique({ where: { id: jobID } });
+  if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+  const exportDir = exportDirOf(path.join(await getTrainingFolder(), job.name));
+  return NextResponse.json({ supported: job.status === 'running' && (await pauseSupported(exportDir)) });
+}
+
 /**
  * Pause a running job: the trainer saves a checkpoint at the end of the
  * current step and then stops, freeing the GPU (toolkit/job_state_snapshot.py).
@@ -24,19 +43,9 @@ export async function POST(request: NextRequest, { params }: { params: { jobID: 
   }
 
   const exportDir = exportDirOf(path.join(await getTrainingFolder(), job.name));
-  let marker: { pause?: boolean } | null = null;
-  try {
-    marker = JSON.parse(await fsp.readFile(path.join(exportDir, TRAINER_MARKER), 'utf-8'));
-  } catch {
-    // run predates the marker
-  }
-  if (!marker?.pause) {
+  if (!(await pauseSupported(exportDir))) {
     return NextResponse.json(
-      {
-        error:
-          'This run was started before pause was supported, so it would not save first. Stop it instead (progress since the last save is lost), or wait for the next regular save.',
-        unsupported: true,
-      },
+      { error: 'This run was started before pause was supported, so it would not save first.' },
       { status: 409 },
     );
   }
